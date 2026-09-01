@@ -967,6 +967,84 @@ namespace UniGetUI.Core.Tools
         }
 
         /// <summary>
+        /// Runs a command and returns its trimmed standard output. <paramref name="timeout"/> is the
+        /// total budget; the command and the children it still owns are killed once it elapses.
+        /// </summary>
+        /// <remarks>
+        /// A descendant that outlives the command itself cannot be reached: the OS reparents it as
+        /// soon as the root exits, so it stays out of the process tree while still holding the
+        /// output pipe open. Such a call times out and reports failure instead of returning output.
+        /// </remarks>
+        public static bool TryReadStandardOutput(
+            ProcessStartInfo startInfo,
+            TimeSpan timeout,
+            out string output
+        )
+        {
+            output = "";
+            Process? process = null;
+            Task<string>? reader = null;
+            var budget = Stopwatch.StartNew();
+            try
+            {
+                process = Process.Start(startInfo);
+                if (process is null)
+                    return false;
+
+                // StandardOutput.ReadToEnd() blocks until the child closes stdout, which a hung
+                // child never does, making any later WaitForExit(timeout) unreachable. Wait on
+                // the read itself instead, and kill the child so the pipe gets released.
+                reader = process.StandardOutput.ReadToEndAsync();
+                if (!reader.Wait(timeout))
+                {
+                    // An exited root means a descendant inherited stdout and is holding it open;
+                    // it is already reparented, so killing the tree below cannot reach it.
+                    string cause = process.HasExited
+                        ? "it exited but something it started still holds its output open"
+                        : "it did not respond in time and will be terminated";
+                    Logger.Warn(
+                        $"Could not read the output of '{startInfo.FileName}' within "
+                            + $"{timeout.TotalSeconds:0.#}s: {cause}"
+                    );
+                    return false;
+                }
+
+                // stdout reached EOF, so the output is complete whether or not the child has left
+                // yet. Give it what remains of the budget to exit on its own; the finally kills it
+                // otherwise, so a child that drops stdout early cannot stretch the wait past it.
+                TimeSpan remaining = timeout - budget.Elapsed;
+                if (remaining > TimeSpan.Zero)
+                    process.WaitForExit((int)remaining.TotalMilliseconds);
+
+                output = reader.Result.Trim();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn($"Could not read the output of '{startInfo.FileName}':");
+                Logger.Warn(ex);
+                return false;
+            }
+            finally
+            {
+                try
+                {
+                    if (process is not null && !process.HasExited)
+                        process.Kill(entireProcessTree: true);
+                }
+                catch
+                {
+                    // Best effort: the process may have exited on its own in the meantime.
+                }
+
+                // Dispose() leaves StandardOutput open (we read it in sync mode), so an abandoned
+                // read ends by itself once the killed child's pipe hits EOF. Observe it regardless.
+                reader?.ContinueWith(static t => _ = t.Exception, TaskScheduler.Default);
+                process?.Dispose();
+            }
+        }
+
+        /// <summary>
         /// Pings the update server and 3 well-known sites to check for internet availability
         /// </summary>
         public static async Task WaitForInternetConnection() =>
