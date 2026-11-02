@@ -13,6 +13,7 @@ using UniGetUI.Core.Tools;
 using UniGetUI.Interface.Enums;
 using UniGetUI.Interface.Telemetry;
 using UniGetUI.PackageEngine;
+using UniGetUI.PackageEngine.Classes.Manager.Classes;
 using UniGetUI.PackageEngine.Classes.Serializable;
 using UniGetUI.PackageEngine.Enums;
 using UniGetUI.PackageEngine.Interfaces;
@@ -46,6 +47,8 @@ public class PackageBundlesPage : AbstractPackagesPage
         }
     }
     public event EventHandler? UnsavedChangesStateChanged;
+
+    public bool HasChangesToLose => _loader.Any() && HasUnsavedChanges;
 
     public PackageBundlesPage() : base(new PackagesPageData
     {
@@ -84,6 +87,7 @@ public class PackageBundlesPage : AbstractPackagesPage
         SetMainButton("download", CoreTools.Translate("Install selection"), () =>
             _ = ImportAndInstallPackage(GetCheckedNonInstalledPackages(vm)));
 
+        EnableMainButtonWhenPackagesChecked();
         SetMainButtonDropdown(new MenuFlyout
         {
             Items = { installAsAdmin, installInteractive, installSkipHash, new Separator(), downloadInstallers },
@@ -105,14 +109,14 @@ public class PackageBundlesPage : AbstractPackagesPage
         ViewModel.AddToolbarButton("console", CoreTools.Translate("Create .ps1 script"),
             () => _ = CreateBatchScriptAsync());
         ViewModel.AddToolbarSeparator();
-        ViewModel.AddToolbarButton("delete", CoreTools.Translate("Remove selection from bundle"), () =>
+        EnableWhen(ViewModel.AddToolbarButton("delete", CoreTools.Translate("Remove selection from bundle"), () =>
         {
             HasUnsavedChanges = true;
             _loader.RemoveRange(vm.FilteredPackages.GetCheckedPackages());
-        });
+        }), () => HasCheckedPackages);
         ViewModel.AddToolbarSeparator();
-        ViewModel.AddToolbarButton("info_round", CoreTools.Translate("Package details"),
-            () => _ = ShowDetailsForPackage(SelectedItem), showLabel: false);
+        EnableWhen(ViewModel.AddToolbarButton("info_round", CoreTools.Translate("Package details"),
+            () => _ = ShowDetailsForPackage(SelectedItem), showLabel: false), () => HasSelectedItem);
     }
 
     private static IReadOnlyList<IPackage> GetCheckedNonInstalledPackages(PackagesPageViewModel vm)
@@ -241,12 +245,20 @@ public class PackageBundlesPage : AbstractPackagesPage
     // ─── Bundle operations ────────────────────────────────────────────────────
     public async Task<bool> AskForNewBundle()
     {
-        if (_loader.Any() && HasUnsavedChanges && !await AskLoseChanges())
+        if (!await ConfirmDiscardingCurrentBundle())
             return false;
 
+        ClearCurrentBundle();
+        return true;
+    }
+
+    private async Task<bool> ConfirmDiscardingCurrentBundle()
+        => !HasChangesToLose || await AskLoseChanges();
+
+    private void ClearCurrentBundle()
+    {
         _loader.ClearPackages();
         HasUnsavedChanges = false;
-        return true;
     }
 
     public async Task ImportAndInstallPackage(
@@ -311,17 +323,17 @@ public class PackageBundlesPage : AbstractPackagesPage
 
     public async Task OpenFromString(string payload, BundleFormatType format, string source, int? _loadingId = null)
     {
-        if (!await AskForNewBundle()) return;
+        if (!await ConfirmDiscardingCurrentBundle()) return;
 
-        var (openVersion, report) = await AddFromBundle(payload, format);
+        var (openVersion, report, imported) = await AddFromBundle(
+            payload, format, ShowBundleSecurityReport, replaceExisting: true, source: source);
+        if (!imported) return;
+
         TelemetryHandler.ImportBundle(format);
         HasUnsavedChanges = false;
 
         if ((int)(openVersion * 10) != (int)(SerializableBundle.ExpectedVersion * 10))
             Logger.Warn($"Bundle \"{source}\" uses schema version {openVersion}, expected {SerializableBundle.ExpectedVersion}.");
-
-        if (!report.IsEmpty && GetMainWindow() is { } win)
-            await ShowBundleSecurityReport(win, report);
     }
 
     /// <summary>Compatibility overload matching the legacy stub signature.</summary>
@@ -332,7 +344,6 @@ public class PackageBundlesPage : AbstractPackagesPage
 
     public async Task AskOpenFromFile()
     {
-        if (!await AskForNewBundle()) return;
         if (GetMainWindow() is not { } win) return;
 
         var files = await win.StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
@@ -415,7 +426,12 @@ public class PackageBundlesPage : AbstractPackagesPage
         return exportableData.AsJsonString();
     }
 
-    public async Task<(double, BundleReport)> AddFromBundle(string content, BundleFormatType format)
+    public async Task<(double Version, BundleReport Report, bool Imported)> AddFromBundle(
+        string content,
+        BundleFormatType format,
+        Func<BundleReport, Task<bool>>? acknowledge = null,
+        bool replaceExisting = false,
+        string source = "")
     {
         if (format is BundleFormatType.YAML)
         {
@@ -433,45 +449,64 @@ public class PackageBundlesPage : AbstractPackagesPage
                 ?? throw new JsonException("Could not parse JSON object")));
 
         var report = new BundleReport { IsEmpty = true };
-        bool allowCLI = SecureSettings.Get(SecureSettings.K.AllowCLIArguments)
-                            && SecureSettings.Get(SecureSettings.K.AllowImportingCLIArguments);
-        bool allowPrePost = SecureSettings.Get(SecureSettings.K.AllowPrePostOpCommand)
-                            && SecureSettings.Get(SecureSettings.K.AllowImportPrePostOpCommands);
+        bool allowCLI = BundleImportFilter.CliArgumentsAllowed();
+        bool allowPrePost = BundleImportFilter.PrePostCommandsAllowed();
 
         var packages = new List<IPackage>();
         foreach (var pkg in deserializedData.packages)
         {
-            var opts = pkg.InstallationOptions;
-            ReportList(ref report, pkg.Id, opts.CustomParameters_Install, "Custom install arguments", allowCLI);
-            ReportList(ref report, pkg.Id, opts.CustomParameters_Update, "Custom update arguments", allowCLI);
-            ReportList(ref report, pkg.Id, opts.CustomParameters_Uninstall, "Custom uninstall arguments", allowCLI);
-            opts.PreInstallCommand = ReportStr(ref report, pkg.Id, opts.PreInstallCommand, "Pre-install command", allowPrePost);
-            opts.PostInstallCommand = ReportStr(ref report, pkg.Id, opts.PostInstallCommand, "Post-install command", allowPrePost);
-            opts.PreUpdateCommand = ReportStr(ref report, pkg.Id, opts.PreUpdateCommand, "Pre-update command", allowPrePost);
-            opts.PostUpdateCommand = ReportStr(ref report, pkg.Id, opts.PostUpdateCommand, "Post-update command", allowPrePost);
-            opts.PreUninstallCommand = ReportStr(ref report, pkg.Id, opts.PreUninstallCommand, "Pre-uninstall command", allowPrePost);
-            opts.PostUninstallCommand = ReportStr(ref report, pkg.Id, opts.PostUninstallCommand, "Post-uninstall command", allowPrePost);
-            pkg.InstallationOptions = opts;
+            var manager = ResolveManagerForImport(pkg.ManagerName);
+            var (sourceName, sourceStatus) = BundleImportFilter.ClassifySource(manager, pkg.Source);
+            pkg.InstallationOptions = BundleImportFilter.Apply(
+                ref report,
+                new BundleReportSubject(
+                    pkg.Id, pkg.Name, manager?.DisplayName ?? pkg.ManagerName, sourceName),
+                pkg.InstallationOptions, allowCLI, allowPrePost,
+                manager?.CommandLineIsShellInterpreted ?? false, sourceName, sourceStatus);
             packages.Add(DeserializePackage(pkg));
         }
 
         foreach (var pkg in deserializedData.incompatible_packages)
             packages.Add(DeserializeIncompatiblePackage(pkg, NullSource.Instance));
 
+        BundleImportFilter.LogReport(report, source);
+
+        if (!report.IsEmpty && acknowledge is not null && !await acknowledge(report))
+        {
+            Logger.Warn("The bundle import was discarded by the user after the security report");
+            return (deserializedData.export_version, report, false);
+        }
+
+        if (report.HasHighSeverityFindings)
+            Logger.Warn("The user accepted a bundle carrying high-severity security findings");
+
+        if (replaceExisting)
+            ClearCurrentBundle();
+
         await PackageBundlesLoader.Instance.AddPackagesAsync(packages);
 
-        return (deserializedData.export_version, report);
+        return (deserializedData.export_version, report, true);
+    }
+
+    private static IPackageManager? ResolveManagerForImport(string managerName)
+    {
+        foreach (var manager in PEInterface.Managers)
+        {
+            if (
+                manager.Id == managerName
+                || manager.Name == managerName
+                || manager.DisplayName == managerName
+            )
+                return manager;
+        }
+
+        return null;
     }
 
     // ─── Deserialization helpers ──────────────────────────────────────────────
     public static IPackage DeserializePackage(SerializablePackage raw)
     {
-        IPackageManager? manager = null;
-        foreach (var m in PEInterface.Managers)
-        {
-            if (m.Id == raw.ManagerName || m.Name == raw.ManagerName || m.DisplayName == raw.ManagerName)
-            { manager = m; break; }
-        }
+        IPackageManager? manager = ResolveManagerForImport(raw.ManagerName);
 
         IManagerSource? source;
         if (manager?.Capabilities.SupportsCustomSources == true)
@@ -491,25 +526,6 @@ public class PackageBundlesPage : AbstractPackagesPage
 
     public static IPackage DeserializeIncompatiblePackage(SerializableIncompatiblePackage raw, IManagerSource source)
         => new InvalidImportedPackage(raw, source);
-
-    // ─── Security report helpers ──────────────────────────────────────────────
-    private static void ReportList(ref BundleReport report, string id, List<string> values, string label, bool allowed)
-    {
-        if (!values.Any(x => x.Any())) return;
-        if (!report.Contents.ContainsKey(id)) report.Contents[id] = [];
-        report.Contents[id].Add(new BundleReportEntry($"{label}: [{string.Join(", ", values)}]", allowed));
-        report.IsEmpty = false;
-        if (!allowed) values.Clear();
-    }
-
-    private static string ReportStr(ref BundleReport report, string id, string value, string label, bool allowed)
-    {
-        if (!value.Any()) return value;
-        if (!report.Contents.ContainsKey(id)) report.Contents[id] = [];
-        report.Contents[id].Add(new BundleReportEntry($"{label}: {value}", allowed));
-        report.IsEmpty = false;
-        return allowed ? value : "";
-    }
 
     // ─── Batch script export ──────────────────────────────────────────────────
     private async Task CreateBatchScriptAsync()
@@ -539,16 +555,42 @@ public class PackageBundlesPage : AbstractPackagesPage
             {
                 if (p is not ImportedPackage pkg) continue;
 
+                // Resolved before anything is appended: a package whose command line is refused
+                // must contribute nothing at all, or its imported pre-install command would still
+                // run from the script even though the install itself was dropped.
+                IReadOnlyList<string> param;
+                try
+                {
+                    var exported = pkg.installation_options.Copy();
+                    exported.CustomInstallLocation = InstallOptionsFactory.ExpandPackagePlaceholders(
+                        exported.CustomInstallLocation, pkg);
+                    param = pkg.Manager.OperationHelper.GetStandaloneParameters(
+                        pkg, exported, OperationType.Install);
+                }
+                catch (InvalidOperationException ex)
+                {
+                    Logger.Warn($"Skipping {pkg.Id} in the exported script: {ex.Message}");
+                    continue;
+                }
+
                 packages.Add(pkg.Name + " from " + pkg.Manager.DisplayName);
 
                 foreach (var process in pkg.installation_options.KillBeforeOperation)
+                {
+                    // Refused rather than stripped: dropping a character would silently retarget
+                    // the kill at whatever process the shortened name happens to match.
+                    if (!CoreTools.IsSafeProcessImageName(process))
+                    {
+                        Logger.Warn(
+                            $"Skipping the process \"{process}\" of {pkg.Id} in the exported script: it is not a usable process name.");
+                        continue;
+                    }
                     commands.Add($"taskkill /im \"{process}\"" + (forceKill ? " /f" : ""));
+                }
 
                 if (pkg.installation_options.PreInstallCommand != "")
                     commands.Add(pkg.installation_options.PreInstallCommand);
 
-                var param = pkg.Manager.OperationHelper.GetParameters(
-                    pkg, pkg.installation_options, OperationType.Install);
                 commands.Add($"{pkg.Manager.Properties.ExecutableFriendlyName} {string.Join(' ', param)}");
 
                 if (pkg.installation_options.PostInstallCommand != "")
@@ -604,7 +646,7 @@ public class PackageBundlesPage : AbstractPackagesPage
             if ($args[0] -ne "/DisablePausePrompts") { pause }
             Write-Host ""
             Write-Host "This script will attempt to install the following packages:"
-            {{string.Join('\n', names.Select(x => $"Write-Host \"  - {x}\""))}}
+            {{string.Join('\n', names.Select(x => $"Write-Host {CoreTools.EscapePowerShellSingleQuoted($"  - {x}")}"))}}
             Write-Host ""
             if ($args[0] -ne "/DisablePausePrompts") { pause }
             Clear-Host
@@ -670,8 +712,14 @@ public class PackageBundlesPage : AbstractPackagesPage
         return dialog.Confirmed;
     }
 
-    private static async Task ShowBundleSecurityReport(Window owner, BundleReport report)
-        => await new BundleSecurityReportDialog(report).ShowDialog(owner);
+    private static async Task<bool> ShowBundleSecurityReport(BundleReport report)
+    {
+        if (GetMainWindow() is not { } owner) return !report.HasHighSeverityFindings;
+
+        var dialog = new BundleSecurityReportDialog(report);
+        await dialog.ShowDialog(owner);
+        return dialog.Accepted;
+    }
 
     private static async Task ShowErrorDialog(Window owner, string title, string message)
         => await new SimpleErrorDialog(title, message).ShowDialog(owner);

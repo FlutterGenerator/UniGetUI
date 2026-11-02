@@ -54,7 +54,7 @@ namespace UniGetUI.Core.Language
                 Locale = ResolveLocale(lang);
 
                 MainLangDict = LoadLanguageFile(Locale);
-                Formatter = new() { Locale = Locale.Replace('_', '-') };
+                Formatter = CreateFormatter(Locale);
 
                 SelectedLocale = Locale;
                 Logger.Info("Loaded language locale: " + Locale);
@@ -67,9 +67,27 @@ namespace UniGetUI.Core.Language
                 // Keep the app functional even if locale resolution fails.
                 Locale = "en";
                 MainLangDict = LoadLanguageFile(Locale);
-                Formatter = new() { Locale = "en" };
+                Formatter = CreateFormatter(Locale);
                 SelectedLocale = Locale;
             }
+        }
+
+        private static MessageFormatter CreateFormatter(string locale)
+        {
+            string formatterLocale = locale.Replace('_', '-');
+            try
+            {
+                CultureInfo.GetCultureInfo(formatterLocale);
+            }
+            catch (CultureNotFoundException)
+            {
+                Logger.Warn(
+                    $"Culture \"{formatterLocale}\" is not available, formatting translated strings with the invariant culture"
+                );
+                formatterLocale = CultureInfo.InvariantCulture.Name;
+            }
+
+            return new() { Locale = formatterLocale };
         }
 
         private static string ResolveLocale(string lang)
@@ -134,15 +152,11 @@ namespace UniGetUI.Core.Language
         {
             try
             {
-                string BundledLangFileToLoad = Path.Join(
-                    CoreData.UniGetUIExecutableDirectory,
-                    "Assets",
-                    "Languages",
-                    "lang_" + LangKey + ".json"
-                );
+                string BundledLangAsset = "Languages/lang_" + LangKey + ".json";
+                string BundledLangFileToLoad = BundledAssets.DiskPath(BundledLangAsset);
                 Dictionary<string, string> LangDict = [];
 
-                if (!File.Exists(BundledLangFileToLoad))
+                if (!BundledAssets.Exists(BundledLangAsset))
                 {
                     Logger.Error(
                         $"Tried to access a non-existing bundled language file! file={BundledLangFileToLoad}"
@@ -153,7 +167,7 @@ namespace UniGetUI.Core.Language
                     try
                     {
                         LangDict = ParseLanguageEntries(
-                            File.ReadAllText(BundledLangFileToLoad),
+                            BundledAssets.ReadAllText(BundledLangAsset),
                             BundledLangFileToLoad
                         );
                     }
@@ -274,7 +288,7 @@ namespace UniGetUI.Core.Language
 
         public string Translate(string key, Dictionary<string, object?> dict)
         {
-            Formatter ??= new() { Locale = (Locale ?? "en").Replace('_', '-') };
+            Formatter ??= CreateFormatter(Locale ?? "en");
             return Formatter.FormatMessage(Translate(key), dict);
         }
     }

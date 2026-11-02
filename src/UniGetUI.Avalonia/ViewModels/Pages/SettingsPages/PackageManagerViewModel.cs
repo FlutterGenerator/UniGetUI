@@ -3,6 +3,7 @@ using Avalonia.Controls;
 using Avalonia.Platform.Storage;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+using UniGetUI.Avalonia.Views;
 using UniGetUI.Core.Data;
 using UniGetUI.Core.Tools;
 using UniGetUI.PackageEngine.Interfaces;
@@ -65,6 +66,7 @@ public partial class PackageManagerViewModel : ViewModelBase
         await Task.Run(Manager.Initialize);
         IsLoading = false;
         RefreshState(showVersion: true);
+        (MainWindow.Instance?.DataContext as MainWindowViewModel)?.ReloadPagesWithoutReadyManager();
     }
 
     [RelayCommand]
@@ -99,7 +101,7 @@ public partial class PackageManagerViewModel : ViewModelBase
             StatusTitle = CoreTools.Translate("{pm} is disabled").Replace("{pm}", Manager.DisplayName);
             StatusMessage = CoreTools.Translate("Enable it to install packages from {pm}.").Replace("{pm}", Manager.DisplayName);
         }
-        else if (Manager.Status.Found)
+        else if (Manager.IsReady())
         {
             Severity = ManagerStatusSeverity.Success;
             StatusTitle = CoreTools.Translate("{pm} is enabled and ready to go").Replace("{pm}", Manager.DisplayName);
@@ -121,6 +123,12 @@ public partial class PackageManagerViewModel : ViewModelBase
                 StatusMessage = CoreTools.Translate("{pm} version:").Replace("{pm}", Manager.DisplayName)
                                 + " " + Manager.Status.Version;
             }
+        }
+        else if (Manager.Status.Found)
+        {
+            Severity = ManagerStatusSeverity.Error;
+            StatusTitle = CoreTools.Translate("{pm} could not be loaded").Replace("{pm}", Manager.DisplayName);
+            StatusMessage = CoreTools.Translate("{pm} was found on your system, but it could not be started. Check the UniGetUI log for more details.").Replace("{pm}", Manager.DisplayName);
         }
         else
         {

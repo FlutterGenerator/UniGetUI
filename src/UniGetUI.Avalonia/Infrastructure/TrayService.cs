@@ -9,6 +9,7 @@ using UniGetUI.Core.Logging;
 using UniGetUI.Core.SettingsEngine;
 using UniGetUI.Core.Tools;
 using UniGetUI.PackageEngine.Enums;
+using UniGetUI.PackageEngine.Operations.Reboot;
 using UniGetUI.PackageEngine.PackageLoader;
 
 namespace UniGetUI.Avalonia.Infrastructure;
@@ -16,15 +17,39 @@ namespace UniGetUI.Avalonia.Infrastructure;
 internal sealed class TrayService : IDisposable
 {
     private readonly TrayIcon _trayIcon;
+    private readonly NativeMenuItem _restartComputerItem;
     private string _lastIconUri = "";
 
     public TrayService(MainWindow owner)
     {
+        _restartComputerItem = new NativeMenuItem(CoreTools.Translate("Restart computer"))
+        {
+            IsVisible = false,
+        };
+        _restartComputerItem.Click += (_, _) => Dispatcher.UIThread.Post(() =>
+        {
+            owner.ShowFromTray();
+            _ = SystemRestartService.ConfirmAndRestartAsync(owner);
+        });
+
         _trayIcon = new TrayIcon
         {
             ToolTipText = "UniGetUI",
-            Menu = BuildMenu(owner),
+            Menu = BuildMenu(owner, _restartComputerItem),
         };
+
+        // macOS tints the menu bar from the wallpaper, not from the system appearance, so no theme
+        // check can pick the right glyph; a template icon is masked and tinted by macOS itself.
+        if (OperatingSystem.IsMacOS())
+        {
+            MacOSProperties.SetIsTemplateIcon(_trayIcon, true);
+        }
+
+        PendingRebootStore.Changed += OnPendingRebootStoreChanged;
+        if (Application.Current?.PlatformSettings is { } platformSettings)
+        {
+            platformSettings.ColorValuesChanged += OnPlatformColorValuesChanged;
+        }
 
         _trayIcon.Clicked += (_, _) => Dispatcher.UIThread.Post(() => owner.ShowFromTray());
 
@@ -38,7 +63,7 @@ internal sealed class TrayService : IDisposable
     {
         try
         {
-            _trayIcon.IsVisible = !Settings.Get(Settings.K.DisableSystemTray);
+            _trayIcon.IsVisible = Settings.IsSystemTrayIconVisible();
 
             string status;
             string tooltip;
@@ -47,6 +72,17 @@ internal sealed class TrayService : IDisposable
                 o => o.Status is OperationStatus.Running or OperationStatus.InQueue);
 
             int updatesCount = UpgradablePackagesLoader.Instance?.Count() ?? 0;
+
+            int rebootPendingCount = PendingRebootStore.PendingCount;
+            bool appRestartRequired = AvaloniaOperationRegistry.AppRestartRequired;
+
+            _restartComputerItem.IsVisible = rebootPendingCount > 0;
+            _restartComputerItem.Header = rebootPendingCount switch
+            {
+                0 => CoreTools.Translate("Restart computer"),
+                1 => CoreTools.Translate("Restart computer (1 package pending)"),
+                _ => CoreTools.Translate("Restart computer ({0} packages pending)", rebootPendingCount),
+            };
 
             if (anyRunning)
             {
@@ -58,10 +94,18 @@ internal sealed class TrayService : IDisposable
                 status = "orange";
                 tooltip = CoreTools.Translate("Attention required");
             }
-            else if (AvaloniaOperationRegistry.RestartRequired)
+            else if (rebootPendingCount > 0 || appRestartRequired)
             {
                 status = "turquoise";
-                tooltip = CoreTools.Translate("Restart required");
+                tooltip = (rebootPendingCount, appRestartRequired) switch
+                {
+                    (0, _) => CoreTools.Translate("Restart UniGetUI to fully apply changes"),
+                    (1, false) => CoreTools.Translate(
+                        "1 package is waiting for your computer to restart"),
+                    (_, false) => CoreTools.Translate(
+                        "{0} packages are waiting for your computer to restart", rebootPendingCount),
+                    _ => CoreTools.Translate("UniGetUI and your computer both need to be restarted"),
+                };
             }
             else if (updatesCount > 0)
             {
@@ -111,13 +155,31 @@ internal sealed class TrayService : IDisposable
             return false;
         }
 #else
-        // On Linux (and other platforms), mirror the app's active theme variant so
-        // the icon remains legible regardless of the desktop colour scheme.
-        return Application.Current?.ActualThemeVariant == ThemeVariant.Light;
+        // macOS: the icon is a template (see the constructor), only its alpha is used.
+        if (OperatingSystem.IsMacOS())
+        {
+            return true;
+        }
+
+        // The Linux panel follows the desktop appearance, not UniGetUI's own theme.
+        var app = Application.Current;
+        PlatformThemeVariant? osVariant = app?.PlatformSettings?.GetColorValues().ThemeVariant;
+        if (osVariant is not null)
+        {
+            return osVariant == PlatformThemeVariant.Light;
+        }
+
+        return app?.ActualThemeVariant == ThemeVariant.Light;
 #endif
     }
 
-    private static NativeMenu BuildMenu(MainWindow owner)
+    private void OnPendingRebootStoreChanged(object? sender, EventArgs e)
+        => Dispatcher.UIThread.Post(UpdateStatus);
+
+    private void OnPlatformColorValuesChanged(object? sender, PlatformColorValues e)
+        => Dispatcher.UIThread.Post(UpdateStatus);
+
+    private static NativeMenu BuildMenu(MainWindow owner, NativeMenuItem restartComputerItem)
     {
         var menu = new NativeMenu();
 
@@ -133,6 +195,7 @@ internal sealed class TrayService : IDisposable
         menu.Add(discover);
         menu.Add(updates);
         menu.Add(installed);
+        menu.Add(restartComputerItem);
         menu.Add(new NativeMenuItemSeparator());
 
         menu.Add(new NativeMenuItem(
@@ -155,7 +218,13 @@ internal sealed class TrayService : IDisposable
 
     public void Dispose()
     {
+        PendingRebootStore.Changed -= OnPendingRebootStoreChanged;
         var app = Application.Current;
+        if (app?.PlatformSettings is { } platformSettings)
+        {
+            platformSettings.ColorValuesChanged -= OnPlatformColorValuesChanged;
+        }
+
         if (app is not null)
             TrayIcon.GetIcons(app)?.Remove(_trayIcon);
         _trayIcon.Dispose();

@@ -1,9 +1,9 @@
 using Avalonia;
 using Avalonia.Controls;
-using Avalonia.Input;
 using Avalonia.Layout;
-using Avalonia.Media;
+using UniGetUI.Avalonia.Infrastructure;
 using UniGetUI.Avalonia.ViewModels.Pages.SettingsPages;
+using UniGetUI.Avalonia.Views.Controls;
 using UniGetUI.Core.Language;
 using UniGetUI.Core.Tools;
 using CoreSettings = global::UniGetUI.Core.SettingsEngine.Settings;
@@ -47,6 +47,30 @@ public sealed partial class General : UserControl, ISettingsPage
         LanguageSelector.ShowAddedItems();
         LanguageSelector.ValueChanged += (s, e) => RestartRequired?.Invoke(s, e);
         LanguageSelector.Description = BuildTranslatorDescription();
+
+        GeneralUpdaterCard.Click += (_, _) =>
+            _ = AvaloniaAutoUpdater.CheckAndInstallUpdatesAsync(autoLaunch: false, manualCheck: true);
+        bool backgroundInstallNeedsElevation = AvaloniaAutoUpdater.BackgroundInstallNeedsElevation();
+        InstallUpdatesWhenIdleCard.IsVisible = OperatingSystem.IsWindows();
+        if (backgroundInstallNeedsElevation)
+            InstallUpdatesWhenIdleCard.WarningText = CoreTools.Translate("UniGetUI can only install its updates in the background when it is installed for the current user, or while it runs as administrator.");
+        InstallUpdatesWhenIdleCard.IsEnabled = GeneralUpdaterCard.Checked && !backgroundInstallNeedsElevation;
+        GeneralUpdaterCard.StateChanged += (_, _) =>
+        {
+            InstallUpdatesWhenIdleCard.IsEnabled = GeneralUpdaterCard.Checked && !backgroundInstallNeedsElevation;
+            if (GeneralUpdaterCard.Checked)
+            {
+                _ = AvaloniaAutoUpdater.CheckAndInstallUpdatesAsync(autoLaunch: false, manualCheck: false);
+            }
+        };
+        EnableUniGetUIBetaCard.StateChanged += (_, _) =>
+        {
+            AvaloniaAutoUpdater.CancelObsoletePendingUpdateForChannelChange();
+            if (!CoreSettings.Get(CoreSettings.K.DisableAutoUpdateWingetUI))
+            {
+                _ = AvaloniaAutoUpdater.CheckAndInstallUpdatesAsync(autoLaunch: false, manualCheck: false);
+            }
+        };
     }
 
     private static StackPanel BuildTranslatorDescription()
@@ -58,16 +82,14 @@ public sealed partial class General : UserControl, ISettingsPage
             Opacity = 0.8,
         };
 
-        var link = new TextBlock
+        var link = new HyperlinkText
         {
             Text = CoreTools.Translate("Become a translator"),
-            TextDecorations = TextDecorations.Underline,
             VerticalAlignment = VerticalAlignment.Center,
-            Cursor = new Cursor(StandardCursorType.Hand),
             Margin = new Thickness(4, 0, 0, 0),
         };
         link.Bind(TextBlock.ForegroundProperty, link.GetResourceObservable("AccentTextFillColorPrimaryBrush"));
-        link.PointerPressed += (_, _) =>
+        link.Activated += (_, _) =>
             CoreTools.Launch("https://github.com/Devolutions/UniGetUI/blob/main/TRANSLATION.md");
 
         var panel = new StackPanel { Orientation = Orientation.Horizontal };

@@ -2,6 +2,7 @@ using System.Text.Json;
 using UniGetUI.Core.Data;
 using UniGetUI.Core.SettingsEngine;
 using UniGetUI.Core.SettingsEngine.SecureSettings;
+using UniGetUI.Core.Tools;
 using UniGetUI.Shared;
 
 namespace UniGetUI.Tests;
@@ -34,6 +35,137 @@ public sealed class CLIHandlerTests : IDisposable
         {
             Directory.Delete(_testRoot, recursive: true);
         }
+    }
+
+    [Fact]
+    public void ImportSettings_DoesNotWriteOutsideConfigurationDirectoryForCraftedKeys()
+    {
+        string pocPath = Path.Combine(_testRoot, "poc.json");
+        string escaped = Path.Combine(_testRoot, "evil.bat");
+        File.WriteAllText(
+            pocPath,
+            JsonSerializer.Serialize(
+                new Dictionary<string, string>
+                {
+                    [@"..\..\evil.bat"] = "@echo owned",
+                    [@"..\..\..\evil.bat"] = "@echo owned",
+                    ["../../evil.bat"] = "@echo owned",
+                }
+            )
+        );
+
+        int result = SharedPreUiCommandDispatcher.ImportSettings(
+            ["unigetui", SharedPreUiCommandDispatcher.ImportSettingsArgument, pocPath],
+            SharedPreUiCommandDispatcher.WindowsCliExitCodes
+        );
+
+        Assert.Equal(SharedPreUiCommandDispatcher.WindowsCliExitCodes.Success, result);
+        Assert.False(File.Exists(escaped));
+        Assert.Empty(Directory.EnumerateFiles(_testRoot, "evil.bat", SearchOption.AllDirectories));
+    }
+
+    [Theory]
+    [InlineData("unigetui://show")]
+    [InlineData("unigetui:show")]
+    [InlineData("UNIGETUI://Show")]
+    [InlineData("unigetui:")]
+    public void ProtocolLaunch_DropsArgumentsInjectedAlongsideTheUri(string uri)
+    {
+        string[] sanitized = SharedPreUiCommandDispatcher.IgnoreArgumentsInjectedIntoProtocolLaunch(
+            [uri, SharedPreUiCommandDispatcher.ImportSettingsArgument, @"C:\poc.json"]
+        );
+
+        Assert.Equal([uri], sanitized);
+        Assert.Null(
+            SharedPreUiCommandDispatcher.TryHandle(
+                sanitized,
+                SharedPreUiCommandDispatcher.WindowsCliExitCodes
+            )
+        );
+    }
+
+    [Fact]
+    public void ProtocolLaunch_InjectedImportDoesNotRunAndDoesNotResetSettings()
+    {
+        Settings.SetValue(Settings.K.FreshValue, "must-survive");
+
+        string pocPath = Path.Combine(_testRoot, "poc.json");
+        File.WriteAllText(
+            pocPath,
+            JsonSerializer.Serialize(
+                new Dictionary<string, string> { [@"..\..\evil.bat"] = "@echo owned" }
+            )
+        );
+
+        string[] injected =
+        [
+            "unigetui://show",
+            SharedPreUiCommandDispatcher.ImportSettingsArgument,
+            pocPath,
+        ];
+
+        string[] sanitized = SharedPreUiCommandDispatcher.IgnoreArgumentsInjectedIntoProtocolLaunch(
+            injected
+        );
+
+        Assert.Null(
+            SharedPreUiCommandDispatcher.TryHandle(
+                sanitized,
+                SharedPreUiCommandDispatcher.WindowsCliExitCodes
+            )
+        );
+        Assert.Equal("must-survive", Settings.GetValue(Settings.K.FreshValue));
+    }
+
+    [Fact]
+    public void ProtocolLaunch_LeavesOrdinaryArgumentsUntouched()
+    {
+        string[][] untouched =
+        [
+            ["--import-settings", "settings.json"],
+            ["--daemon"],
+            ["unigetui://show"],
+            [],
+        ];
+
+        foreach (string[] args in untouched)
+        {
+            Assert.Equal(
+                args,
+                SharedPreUiCommandDispatcher.IgnoreArgumentsInjectedIntoProtocolLaunch(args)
+            );
+        }
+    }
+
+    [Fact]
+    public void ProtocolLaunch_InjectedArgumentsDoNotReachProcessArgumentConsumers()
+    {
+        string[] sanitized = SharedPreUiCommandDispatcher.IgnoreArgumentsInjectedIntoProtocolLaunch(
+            ["unigetui://show", "--updateapps", "--import-settings", "poc.json"]
+        );
+
+        CoreData.SetSanitizedProcessArguments(sanitized);
+        string[] published = CoreData.GetProcessArguments();
+
+        Assert.DoesNotContain("--updateapps", published);
+        Assert.DoesNotContain("--import-settings", published);
+        Assert.Contains("unigetui://show", published);
+        Assert.Equal(Environment.GetCommandLineArgs()[0], published[0]);
+    }
+
+    [Fact]
+    public void OrdinaryLaunch_PublishesTheSameShapeAsTheRawCommandLine()
+    {
+        string[] args = ["--daemon"];
+
+        CoreData.SetSanitizedProcessArguments(
+            SharedPreUiCommandDispatcher.IgnoreArgumentsInjectedIntoProtocolLaunch(args)
+        );
+
+        Assert.Equal(
+            [Environment.GetCommandLineArgs()[0], "--daemon"],
+            CoreData.GetProcessArguments()
+        );
     }
 
     [Fact]
@@ -155,5 +287,135 @@ public sealed class CLIHandlerTests : IDisposable
                 )
             )
         );
+    }
+
+    [Fact]
+    public void DeleteShortcuts_RemovesShortcutsUnderAKnownRootWithoutManglingTheirNames()
+    {
+        string root = Path.Combine(_testRoot, "Desktop");
+        Directory.CreateDirectory(root);
+        ShortcutFileRemover.TEST_ShortcutRootsOverride = [root];
+
+        try
+        {
+            string shortcut = Path.Combine(root, "'LibreOffice' 26.8.lnk");
+            File.WriteAllText(shortcut, "shortcut");
+
+            int? result = SharedPreUiCommandDispatcher.TryHandle(
+                ["unigetui", ShortcutFileRemover.CliArgument, shortcut],
+                SharedPreUiCommandDispatcher.WindowsCliExitCodes
+            );
+
+            Assert.Equal(SharedPreUiCommandDispatcher.WindowsCliExitCodes.Success, result);
+            Assert.False(File.Exists(shortcut));
+        }
+        finally
+        {
+            ShortcutFileRemover.TEST_ShortcutRootsOverride = null;
+        }
+    }
+
+    [Fact]
+    public void DeleteShortcuts_RefusesPathsOutsideEveryKnownRoot()
+    {
+        string root = Path.Combine(_testRoot, "Desktop");
+        Directory.CreateDirectory(root);
+        ShortcutFileRemover.TEST_ShortcutRootsOverride = [root];
+
+        try
+        {
+            string outside = Path.Combine(_testRoot, "Payload.lnk");
+            File.WriteAllText(outside, "payload");
+
+            int? result = SharedPreUiCommandDispatcher.TryHandle(
+                ["unigetui", ShortcutFileRemover.CliArgument, outside],
+                SharedPreUiCommandDispatcher.WindowsCliExitCodes
+            );
+
+            Assert.Equal(SharedPreUiCommandDispatcher.WindowsCliExitCodes.Failed, result);
+            Assert.True(File.Exists(outside));
+        }
+        finally
+        {
+            ShortcutFileRemover.TEST_ShortcutRootsOverride = null;
+        }
+    }
+
+    [Fact]
+    public void DeleteShortcuts_ReportsAnInvalidParameterWhenNoPathIsGiven()
+    {
+        Assert.Equal(
+            SharedPreUiCommandDispatcher.WindowsCliExitCodes.InvalidParameter,
+            SharedPreUiCommandDispatcher.TryHandle(
+                ["unigetui", ShortcutFileRemover.CliArgument],
+                SharedPreUiCommandDispatcher.WindowsCliExitCodes
+            )
+        );
+    }
+
+    [Theory]
+    [InlineData("--help")]
+    [InlineData("-h")]
+    public void Help_IsLeftToTheCommandLineInterface(string flag)
+    {
+        Assert.Null(
+            SharedPreUiCommandDispatcher.TryHandle(
+                [flag],
+                SharedPreUiCommandDispatcher.WindowsCliExitCodes
+            )
+        );
+    }
+
+    [Fact]
+    public void Help_AfterACommandPathIsLeftToTheCommandLineInterface()
+    {
+        Assert.Null(
+            SharedPreUiCommandDispatcher.TryHandle(
+                ["package", "install", "--help"],
+                SharedPreUiCommandDispatcher.WindowsCliExitCodes
+            )
+        );
+    }
+
+    [Theory]
+    [InlineData(SharedPreUiCommandDispatcher.ExportSettingsArgument, "--help")]
+    [InlineData(SharedPreUiCommandDispatcher.ExportSettingsArgument, "-h")]
+    [InlineData(SharedPreUiCommandDispatcher.ImportSettingsArgument, "--help")]
+    [InlineData(SharedPreUiCommandDispatcher.ImportSettingsArgument, "-h")]
+    [InlineData(SharedPreUiCommandDispatcher.SetSettingValueArgument, "--help")]
+    [InlineData(SharedPreUiCommandDispatcher.EnableSettingArgument, "-h")]
+    public void Help_WinsOverASettingsCommandThatWouldConsumeItAsAValue(
+        string settingsArgument,
+        string helpFlag
+    )
+    {
+        Assert.Null(
+            SharedPreUiCommandDispatcher.TryHandle(
+                [settingsArgument, helpFlag],
+                SharedPreUiCommandDispatcher.WindowsCliExitCodes
+            )
+        );
+    }
+
+    [Fact]
+    public void Help_DoesNotExportSettingsToAFileNamedAfterTheFlag()
+    {
+        string previous = Directory.GetCurrentDirectory();
+        Directory.SetCurrentDirectory(_testRoot);
+        try
+        {
+            Assert.Null(
+                SharedPreUiCommandDispatcher.TryHandle(
+                    [SharedPreUiCommandDispatcher.ExportSettingsArgument, "--help"],
+                    SharedPreUiCommandDispatcher.WindowsCliExitCodes
+                )
+            );
+
+            Assert.Empty(Directory.GetFiles(_testRoot, "*help*"));
+        }
+        finally
+        {
+            Directory.SetCurrentDirectory(previous);
+        }
     }
 }

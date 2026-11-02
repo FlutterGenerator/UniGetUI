@@ -2,6 +2,7 @@ using UniGetUI.Core.Logging;
 using UniGetUI.Core.SettingsEngine;
 using UniGetUI.Core.SettingsEngine.SecureSettings;
 using UniGetUI.Core.Tools;
+using UniGetUI.Interface;
 
 namespace UniGetUI.Shared;
 
@@ -31,7 +32,6 @@ internal static class SharedPreUiCommandDispatcher
         UnknownSettingsKey: 4
     );
 
-    internal const string HelpArgument = "--help";
     internal const string ImportSettingsArgument = "--import-settings";
     internal const string ExportSettingsArgument = "--export-settings";
     internal const string EnableSettingArgument = "--enable-setting";
@@ -39,6 +39,7 @@ internal static class SharedPreUiCommandDispatcher
     internal const string SetSettingValueArgument = "--set-setting-value";
     internal const string EnableSecureSettingArgument = "--enable-secure-setting";
     internal const string DisableSecureSettingArgument = "--disable-secure-setting";
+    internal const string DeleteShortcutsArgument = ShortcutFileRemover.CliArgument;
     internal const string MigrateWingetUIToUniGetUIArgument = "--migrate-wingetui-to-unigetui";
     internal const string UninstallWingetUIArgument = "--uninstall-wingetui";
     internal const string UninstallUniGetUIArgument = "--uninstall-unigetui";
@@ -46,11 +47,33 @@ internal static class SharedPreUiCommandDispatcher
     private const string EnableSecureSettingForUserArgument = SecureSettings.Args.ENABLE_FOR_USER;
     private const string DisableSecureSettingForUserArgument = SecureSettings.Args.DISABLE_FOR_USER;
 
+    internal const string ProtocolLaunchScheme = "unigetui:";
+
+    public static string[] IgnoreArgumentsInjectedIntoProtocolLaunch(string[] args)
+    {
+        if (args.Length < 2)
+        {
+            return args;
+        }
+
+        if (!args[0].StartsWith(ProtocolLaunchScheme, StringComparison.OrdinalIgnoreCase))
+        {
+            return args;
+        }
+
+        Logger.Warn(
+            $"A {ProtocolLaunchScheme} launch carried {args.Length - 1} extra argument(s). "
+                + "They can only come from an injected quote in the URI, so they are ignored."
+        );
+
+        return [args[0]];
+    }
+
     public static int? TryHandle(IReadOnlyList<string> args, SharedPreUiCommandExitCodes exitCodes)
     {
-        if (args.Contains(HelpArgument))
+        if (IpcCliSyntax.IsHelpRequest(args))
         {
-            return Help();
+            return null;
         }
 
         if (args.Contains(ImportSettingsArgument))
@@ -98,6 +121,11 @@ internal static class SharedPreUiCommandDispatcher
             return DisableSecureSettingForUser(args, exitCodes);
         }
 
+        if (args.Contains(DeleteShortcutsArgument))
+        {
+            return DeleteShortcuts(args, exitCodes);
+        }
+
         if (args.Contains(MigrateWingetUIToUniGetUIArgument))
         {
             return MigrateWingetUIToUniGetUI();
@@ -109,14 +137,6 @@ internal static class SharedPreUiCommandDispatcher
         }
 
         return null;
-    }
-
-    public static int Help()
-    {
-        CoreTools.Launch(
-            "https://github.com/Devolutions/UniGetUI/blob/main/docs/CLI.md#unigetui-command-line-interface"
-        );
-        return 0;
     }
 
     public static int ImportSettings(IReadOnlyList<string> args, SharedPreUiCommandExitCodes exitCodes)
@@ -297,6 +317,31 @@ internal static class SharedPreUiCommandDispatcher
         try
         {
             return SecureSettings.ApplyForUser(user, setting, false);
+        }
+        catch (Exception ex)
+        {
+            return ex.HResult;
+        }
+    }
+
+    public static int DeleteShortcuts(
+        IReadOnlyList<string> args,
+        SharedPreUiCommandExitCodes exitCodes
+    )
+    {
+        int basePos = FindArgumentIndex(args, DeleteShortcutsArgument);
+        if (basePos < 0 || basePos + 1 >= args.Count)
+        {
+            return exitCodes.InvalidParameter;
+        }
+
+        string[] shortcutPaths = [.. args.Skip(basePos + 1)];
+
+        try
+        {
+            return ShortcutFileRemover.DeleteAsElevatedInstance(shortcutPaths) is 0
+                ? exitCodes.Success
+                : exitCodes.Failed;
         }
         catch (Exception ex)
         {

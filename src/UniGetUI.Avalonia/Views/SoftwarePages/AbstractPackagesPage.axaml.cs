@@ -6,6 +6,7 @@ using Avalonia.Animation.Easings;
 using Avalonia.Automation;
 using Avalonia.Controls;
 using Avalonia.Controls.ApplicationLifetimes;
+using Avalonia.Controls.Documents;
 using Avalonia.Input;
 using Avalonia.Input.Platform;
 using Avalonia.Interactivity;
@@ -18,6 +19,7 @@ using Avalonia.Threading;
 using Avalonia.VisualTree;
 using UniGetUI.Avalonia.Extensions;
 using UniGetUI.Avalonia.Infrastructure;
+using UniGetUI.Avalonia.ViewModels;
 using UniGetUI.Avalonia.ViewModels.Pages;
 using UniGetUI.Avalonia.Views.Controls;
 using UniGetUI.Core.Logging;
@@ -41,8 +43,9 @@ public abstract partial class AbstractPackagesPage : UserControl,
     private double? _overlayRestingOffsetX;
     private static readonly SplineEasing FluentEntranceEasing = new(0.1, 0.9, 0.2, 1.0);
     private static readonly TimeSpan FilterAnimationDuration = TimeSpan.FromMilliseconds(300);
+    private readonly MenuFlyout _toolbarOverflowFlyout = new();
 
-    protected AbstractPackagesPage(PackagesPageData data)
+    protected AbstractPackagesPage(PackagesPageData data, Action<PackagesPageViewModel>? configureToolbar = null)
     {
         // InitializeComponent BEFORE setting DataContext so that the svg:Svg
         // Path binding has no context during XamlIlPopulate — Skia crashes if
@@ -66,6 +69,11 @@ public abstract partial class AbstractPackagesPage : UserControl,
 
         // "New version" sort option is only relevant on the updates page
         OrderByNewVersion_Menu.IsVisible = ViewModel.RoleIsUpdateLike;
+        OrderByDownloadSize_Menu.IsVisible = ViewModel.DownloadSizeColumnVisible;
+        OrderByReleaseDate_Menu.IsVisible = ViewModel.ReleaseDateColumnVisible;
+        PopulateColumnsSubmenu();
+        if (OrderByButton.Flyout is MenuFlyout orderByFlyout)
+            orderByFlyout.Opening += (_, _) => PopulateColumnsSubmenu();
 
         // Stamp initial checkmarks, then keep them in sync with sort-property changes
         UpdateSortMenuChecks();
@@ -77,12 +85,27 @@ public abstract partial class AbstractPackagesPage : UserControl,
                 UpdateSortMenuChecks();
                 SyncOrderByButtonName();
             }
+            if (args.PropertyName is nameof(PackagesPageViewModel.DownloadSizeColumnVisible))
+                OrderByDownloadSize_Menu.IsVisible = ViewModel.DownloadSizeColumnVisible;
+            if (args.PropertyName is nameof(PackagesPageViewModel.ReleaseDateColumnVisible))
+                OrderByReleaseDate_Menu.IsVisible = ViewModel.ReleaseDateColumnVisible;
+            if (args.PropertyName is nameof(PackagesPageViewModel.InstallerHostColumnVisible)
+                                  or nameof(PackagesPageViewModel.DownloadSizeColumnVisible)
+                                  or nameof(PackagesPageViewModel.ReleaseDateColumnVisible))
+                LoadRealizedRowValues();
             if (args.PropertyName is nameof(PackagesPageViewModel.IsFilterPaneOpen))
             {
                 SyncFiltersButtonName();
                 UpdateFilterPaneColumn(ViewModel.IsFilterPaneOpen, animate: true);
+                UpdateDetailsPaneLayout();
+            }
+            // Set last by UpdateSubtitle, so the segments and the detail are both current by then
+            if (args.PropertyName is nameof(PackagesPageViewModel.SubtitleAccessibleText))
+            {
+                UpdateSubtitleInlines();
             }
         };
+        UpdateSubtitleInlines();
         SyncFiltersButtonName();
         SyncOrderByButtonName();
 
@@ -96,12 +119,23 @@ public abstract partial class AbstractPackagesPage : UserControl,
 
         // Build the toolbar now that both AXAML controls and the ViewModel are ready
         GenerateToolBar(ViewModel);
+        configureToolbar?.Invoke(ViewModel);
+        InitializeToolbarOverflow();
+        ViewModel.FilteredPackages.SelectionStateChanged += (_, _) => ScheduleSelectionGatesRefresh();
+        PackageList.SelectionChanged += (_, _) => ScheduleSelectionGatesRefresh();
+        // Posted, so subclass predicates only run once their constructor has finished
+        ScheduleSelectionGatesRefresh();
 
-        // Double-click a list row → show details
+        // Double-click a package row → show details. DataGrid-level gestures also receive
+        // header double-clicks, so require an actual row ancestor rather than blacklisting headers.
         PackageList.DoubleTapped += (_, e) =>
         {
-            if (e.Source is Visual source
-                && (source is CheckBox || source.GetVisualAncestors().Any(control => control is CheckBox)))
+            if (e.Source is not Visual source)
+                return;
+
+            var ancestors = source.GetVisualAncestors().ToList();
+            if ((source is CheckBox || ancestors.Any(control => control is CheckBox))
+                || (source is not DataGridRow && !ancestors.Any(control => control is DataGridRow)))
             {
                 return;
             }
@@ -162,14 +196,6 @@ public abstract partial class AbstractPackagesPage : UserControl,
         FilteringPanel.GetObservable(BoundsProperty)
             .SubscribeValue(bounds => OnFilteringPanelWidthChanged(bounds.Width));
 
-        // Responsive: collapse the menu bar to icon-only on narrow windows so the
-        // toolbar buttons stay reachable instead of overflowing (mirrors WinUI).
-        this.GetObservable(BoundsProperty)
-            .SubscribeValue(bounds => UpdateToolbarLayout(bounds.Width));
-        Loaded += (_, _) => Dispatcher.UIThread.Post(
-            () => UpdateToolbarLayout(Bounds.Width),
-            DispatcherPriority.Loaded);
-
         // Grid/icons views: stretch cards to fill each row then reflow (mirrors WinUI's
         // UniformGridLayout) instead of leaving wasted space to the right.
         GridViewItems.GetObservable(BoundsProperty)
@@ -179,6 +205,8 @@ public abstract partial class AbstractPackagesPage : UserControl,
 
         // Overlay backdrop dismisses the filter pane when tapped.
         FilterOverlayBackdrop.PointerPressed += (_, _) => ViewModel.IsFilterPaneOpen = false;
+
+        PackageList.AddHandler(ContextRequestedEvent, PackageList_ContextRequested, RoutingStrategies.Tunnel);
 
         // Wire context menu (built by subclass)
         _contextMenu = GenerateContextMenu();
@@ -199,6 +227,7 @@ public abstract partial class AbstractPackagesPage : UserControl,
 
         // Apply the initial filter-pane state (AXAML defaults to 220px open).
         UpdateFilterPaneColumn(ViewModel.IsFilterPaneOpen);
+        InitializeDetailsPane();
 
         // Attach inline transitions AFTER the initial state so launch doesn't animate. The inline
         // pane uses Avalonia's RenderTransform while the separate compact pane uses the compositor.
@@ -238,10 +267,50 @@ public abstract partial class AbstractPackagesPage : UserControl,
         ViewModel.IconCardWidth = Math.Floor(availableWidth / columns);
     }
 
-    private void UpdateToolbarLayout(double availableWidth)
+    private void InitializeToolbarOverflow()
     {
-        if (availableWidth <= 0) return;
-        ViewModel.SetToolbarLabelsCollapsed(availableWidth < 900);
+        ToolBar.OverflowControl = ToolbarOverflowButton;
+        ToolBar.LabelCollapseRequested = ViewModel.SetToolbarLabelsCollapsed;
+
+        ToolBar.Children.Remove(ToolbarOverflowButton);
+        foreach (var entry in ViewModel.ToolbarEntries)
+            ToolBar.Children.Add(entry.Control);
+        ToolBar.Children.Add(ToolbarOverflowButton);
+
+        _toolbarOverflowFlyout.Opening += (_, _) => PopulateToolbarOverflowFlyout();
+        ToolbarOverflowButton.Flyout = _toolbarOverflowFlyout;
+    }
+
+    private void PopulateToolbarOverflowFlyout()
+    {
+        var items = new List<object>();
+        foreach (var control in ToolBar.OverflowedItems)
+        {
+            var entry = ViewModel.ToolbarEntries.FirstOrDefault(e => ReferenceEquals(e.Control, control));
+            if (entry is null) continue;
+
+            if (entry.Invoke is null && entry.InvokeAt is null)
+            {
+                if (items.Count > 0 && items[^1] is not Separator) items.Add(new Separator());
+                continue;
+            }
+
+            var item = new MenuItem
+            {
+                Header = entry.Label,
+                Icon = LoadMenuIcon(entry.IconName),
+                IsEnabled = control.IsEnabled,
+            };
+            if (entry.InvokeAt is { } invokeAt)
+                item.Click += (_, _) => Dispatcher.UIThread.Post(() => invokeAt(ToolbarOverflowButton));
+            else if (entry.Invoke is { } invoke) item.Click += (_, _) => invoke();
+            items.Add(item);
+        }
+
+        while (items.Count > 0 && items[^1] is Separator) items.RemoveAt(items.Count - 1);
+
+        _toolbarOverflowFlyout.Items.Clear();
+        foreach (var item in items) _toolbarOverflowFlyout.Items.Add(item);
     }
 
     // ─── UI-only: focus the package list ─────────────────────────────────────
@@ -293,6 +362,33 @@ public abstract partial class AbstractPackagesPage : UserControl,
         Height = 16,
     };
 
+    /// <summary>"Copy link": puts a unigetui://package link to the selected package on the clipboard.</summary>
+    protected MenuItem CreateCopyLinkMenuItem()
+    {
+        var item = new MenuItem { Header = CoreTools.Translate("Copy link"), Icon = LoadMenuIcon("share") };
+        item.Click += (_, _) => _ = CopyPackageLinkAsync(SelectedItem);
+        return item;
+    }
+
+    private static async Task CopyPackageLinkAsync(IPackage? package)
+    {
+        if (package is null || !PackageLink.CanLinkTo(package)
+            || GetMainWindow() is not { } win || win.Clipboard is not { } clipboard) return;
+
+        await clipboard.SetTextAsync(PackageLink.FromPackage(package).ToUri());
+
+        if (win.DataContext is not MainWindowViewModel main) return;
+        var toast = new InfoBarViewModel
+        {
+            Title = CoreTools.Translate("A link to {0} was copied to the clipboard", package.Name),
+            Severity = InfoBarSeverity.Success,
+            IsClosable = true,
+            IsOpen = true,
+        };
+        toast.OnClosed = () => main.DismissToast(toast);
+        main.ShowToast(toast);
+    }
+
     // ─── Protected access to main toolbar controls for subclasses ─────────────
     /// <summary>Sets the icon and text of the primary action button.</summary>
     protected void SetMainButton(string svgName, string label, Action onClick)
@@ -307,6 +403,17 @@ public abstract partial class AbstractPackagesPage : UserControl,
     protected void SetMainButtonDropdown(MenuFlyout flyout)
     {
         MainToolbarButtonDropdown.Flyout = flyout;
+    }
+
+    protected void SetPageOptions(Control control) => PageOptions.Content = control;
+
+    protected void SetMainButtonState(bool enabled, bool showDropdown = true)
+    {
+        MainToolbarButton.IsEnabled = enabled;
+        MainToolbarButtonDropdown.IsVisible = showDropdown;
+        // Without its dropdown half, the main button must round its trailing corners too.
+        MainToolbarButton.CornerRadius = showDropdown ? new CornerRadius(4, 0, 0, 4) : new CornerRadius(4);
+        MainToolbarButton.Classes.Set("standalone", !showDropdown);
     }
 
     // ─── Package selection ────────────────────────────────────────────────────
@@ -327,6 +434,46 @@ public abstract partial class AbstractPackagesPage : UserControl,
 
             return null;
         }
+    }
+
+    protected bool HasSelectedItem => SelectedItem is not null;
+    protected bool HasCheckedPackages => ViewModel.FilteredPackages.Any(w => w.IsChecked);
+
+    // ─── Selection-dependent toolbar state ────────────────────────────────────
+    private readonly List<(Control Control, Func<bool> CanExecute)> _selectionGates = [];
+    private bool _selectionGatesRefreshPending;
+
+    /// <summary>Keeps the control enabled only while canExecute holds, rechecked whenever
+    /// packages are focused or checked.</summary>
+    protected T EnableWhen<T>(T control, Func<bool> canExecute) where T : Control
+    {
+        _selectionGates.Add((control, canExecute));
+        return control;
+    }
+
+    /// <summary>Gates the main button and its dropdown on at least one checked package.</summary>
+    protected void EnableMainButtonWhenPackagesChecked()
+    {
+        EnableWhen(MainToolbarButton, () => HasCheckedPackages);
+        EnableWhen(MainToolbarButtonDropdown, () => HasCheckedPackages);
+    }
+
+    protected void RefreshSelectionGates()
+    {
+        foreach (var (control, canExecute) in _selectionGates)
+            control.IsEnabled = canExecute();
+    }
+
+    // Select all checks every row one by one; coalesce those into a single refresh
+    private void ScheduleSelectionGatesRefresh()
+    {
+        if (_selectionGatesRefreshPending) return;
+        _selectionGatesRefreshPending = true;
+        Dispatcher.UIThread.Post(() =>
+        {
+            _selectionGatesRefreshPending = false;
+            RefreshSelectionGates();
+        });
     }
 
     // ─── Operation launchers (delegated to ViewModel) ─────────────────────────
@@ -359,6 +506,28 @@ public abstract partial class AbstractPackagesPage : UserControl,
             CoreTools.Translate("{0}: {1}, {2}", CoreTools.Translate("Order by"), ViewModel.SortFieldName, direction));
     }
 
+    // The numbers are the information that changes: semibold in the body text colour, the words keep the secondary tone
+    private void UpdateSubtitleInlines()
+    {
+        var inlines = new InlineCollection();
+        foreach (SubtitleSegment segment in ViewModel.SubtitleSegments)
+        {
+            var run = new Run(segment.Text);
+            if (segment.IsValue)
+            {
+                run.FontWeight = FontWeight.SemiBold;
+                run.Bind(TextElement.ForegroundProperty, this.GetResourceObservable("TextFillColorPrimaryBrush"));
+            }
+            inlines.Add(run);
+        }
+
+        if (ViewModel.SubtitleDetail.Length > 0)
+            inlines.Add(new Run(ViewModel.SubtitleDetail));
+
+        MainSubtitle.Inlines = inlines;
+        AutomationProperties.SetName(MainSubtitle, ViewModel.SubtitleAccessibleText);
+    }
+
     private void UpdateSortMenuChecks()
     {
         OrderByName_Menu.Icon = Check(ViewModel.SortFieldIndex == 0);
@@ -366,6 +535,8 @@ public abstract partial class AbstractPackagesPage : UserControl,
         OrderByVersion_Menu.Icon = Check(ViewModel.SortFieldIndex == 2);
         OrderByNewVersion_Menu.Icon = Check(ViewModel.SortFieldIndex == 3);
         OrderBySource_Menu.Icon = Check(ViewModel.SortFieldIndex == 4);
+        OrderByDownloadSize_Menu.Icon = Check(ViewModel.SortFieldIndex == 5);
+        OrderByReleaseDate_Menu.Icon = Check(ViewModel.SortFieldIndex == 6);
         OrderByAscending_Menu.Icon = Check(ViewModel.SortAscending);
         OrderByDescending_Menu.Icon = Check(!ViewModel.SortAscending);
     }
@@ -378,7 +549,7 @@ public abstract partial class AbstractPackagesPage : UserControl,
     public void DetailsTriggered() { if (SelectedItem is { } pkg) _ = ShowDetailsForPackage(pkg); }
 
     // ─── IEnterLeaveListener ──────────────────────────────────────────────────
-    public virtual void OnEnter() { }
+    public virtual void OnEnter() => ViewModel.ReloadIfManagerBecameReady();
     public virtual void OnLeave() { }
 
     // ─── ISearchBoxPage ───────────────────────────────────────────────────────
@@ -431,7 +602,7 @@ public abstract partial class AbstractPackagesPage : UserControl,
         var pkg = SelectedItem;
         if (pkg is null) return;
 
-        bool ctrl = e.KeyModifiers.HasFlag(KeyModifiers.Control);
+        bool ctrl = PlatformShortcuts.HasPrimary(e.KeyModifiers);
         bool alt = e.KeyModifiers.HasFlag(KeyModifiers.Alt);
 
         if (e.Key is Key.Enter or Key.Return)
@@ -443,6 +614,72 @@ public abstract partial class AbstractPackagesPage : UserControl,
             else
                 _ = ShowDetailsForPackage(pkg);
             e.Handled = true;
+        }
+    }
+
+    private void PackageList_ContextRequested(object? sender, ContextRequestedEventArgs e)
+    {
+        if (e.Source is not Visual source
+            || (source is not DataGridColumnHeader && source.FindAncestorOfType<DataGridColumnHeader>() is null))
+            return;
+
+        e.Handled = true;
+        var menu = new ContextMenu();
+        foreach (Control item in BuildColumnMenuItems()) menu.Items.Add(item);
+        menu.Open(PackageList);
+    }
+
+    private void PopulateColumnsSubmenu()
+    {
+        Columns_Menu.Items.Clear();
+        foreach (Control item in BuildColumnMenuItems()) Columns_Menu.Items.Add(item);
+    }
+
+    private List<Control> BuildColumnMenuItems()
+    {
+        var vm = ViewModel;
+        var items = new List<Control>
+        {
+            ColumnMenuItem(CoreTools.Translate("Package Name"), PackagesPageViewModel.NameColumn, vm.NameColumnVisible),
+            ColumnMenuItem(CoreTools.Translate("Package ID"), PackagesPageViewModel.IdColumn, vm.IdColumnVisible),
+            ColumnMenuItem(CoreTools.Translate("Version"), PackagesPageViewModel.VersionColumn, vm.VersionColumnVisible),
+        };
+        if (vm.RoleIsUpdateLike)
+            items.Add(ColumnMenuItem(CoreTools.Translate("New version"), PackagesPageViewModel.NewVersionColumn, vm.NewVersionHeaderVisible));
+        items.Add(ColumnMenuItem(CoreTools.Translate("Source"), PackagesPageViewModel.SourceColumn, vm.SourceColumnVisible));
+        if (vm.OptionalColumnsAvailable)
+        {
+            items.Add(new Separator());
+            items.Add(ColumnMenuItem(CoreTools.Translate("Installer host"), PackagesPageViewModel.InstallerHostColumn, vm.InstallerHostColumnVisible));
+            items.Add(ColumnMenuItem(CoreTools.Translate("Download size"), PackagesPageViewModel.DownloadSizeColumn, vm.DownloadSizeColumnVisible));
+            items.Add(ColumnMenuItem(CoreTools.Translate("Release date"), PackagesPageViewModel.ReleaseDateColumn, vm.ReleaseDateColumnVisible));
+        }
+
+        var shown = items.OfType<MenuItem>().Where(item => item.IsChecked).ToList();
+        if (shown.Count == 1) shown[0].IsEnabled = false;
+        return items;
+    }
+
+    private static MenuItem ColumnMenuItem(string label, string column, bool isChecked)
+    {
+        var item = new MenuItem
+        {
+            Header = label,
+            ToggleType = MenuItemToggleType.CheckBox,
+            IsChecked = isChecked,
+        };
+        item.Click += (_, _) => PackagesPageViewModel.SetColumnVisible(column, !isChecked);
+        return item;
+    }
+
+    private void LoadRealizedRowValues()
+    {
+        foreach (DataGridRow row in PackageList.GetVisualDescendants().OfType<DataGridRow>())
+        {
+            if (row.DataContext is not PackageWrapper wrapper) continue;
+            wrapper.EnsureInstallerHostLoaded();
+            wrapper.EnsureDownloadSizeLoaded();
+            wrapper.EnsureReleaseDateLoaded();
         }
     }
 
@@ -461,7 +698,11 @@ public abstract partial class AbstractPackagesPage : UserControl,
     {
         if (width <= 0) return; // layout not complete yet
         bool shouldBeOverlay = width < 1000;
-        if (shouldBeOverlay == _isOverlayMode) return;
+        if (shouldBeOverlay == _isOverlayMode)
+        {
+            UpdateDetailsPaneLayout();
+            return;
+        }
 
         _isOverlayMode = shouldBeOverlay;
         ViewModel.FilterPaneOverlaysContent = _isOverlayMode;
@@ -469,6 +710,7 @@ public abstract partial class AbstractPackagesPage : UserControl,
         // Presentation changes must not alter the user's logical open/closed choice. Each mode
         // owns a separate visual, so switching modes only activates the appropriate instance.
         UpdateFilterPaneColumn(ViewModel.IsFilterPaneOpen);
+        UpdateDetailsPaneLayout();
     }
 
     private void UpdateFilterPaneColumn(bool open, bool animate = false)
@@ -503,7 +745,7 @@ public abstract partial class AbstractPackagesPage : UserControl,
                 InlineSidePanel.IsVisible = open;
                 SetInlineSidePanelTransformInstant(open ? 0 : -_savedFilterPaneWidth);
                 FilteringPanel.ColumnDefinitions[0].Width = open ? new GridLength(_savedFilterPaneWidth) : new GridLength(0);
-                FilteringPanel.ColumnDefinitions[1].Width = open ? new GridLength(4) : new GridLength(0);
+                FilteringPanel.ColumnDefinitions[1].Width = open ? new GridLength(12) : new GridLength(0);
             }
         }
     }
@@ -641,7 +883,7 @@ public abstract partial class AbstractPackagesPage : UserControl,
         {
             // Reserve the column (one reflow), then slide the pane in from -width to 0.
             col0.Width = new GridLength(_savedFilterPaneWidth);
-            col1.Width = new GridLength(4);
+            col1.Width = new GridLength(12);
             InlineSidePanel.IsVisible = true;
             InlineSidePanel.RenderTransform = TranslateX(0);
         }

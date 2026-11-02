@@ -46,6 +46,21 @@ namespace UniGetUI.PackageEngine.ManagerClasses.Manager
         public virtual Encoding OutputEncoding => Encoding.UTF8;
         public virtual bool InstallerUrlFollowsPackageVersion => false;
 
+        public virtual bool CommandLineIsShellInterpreted => false;
+
+        public virtual bool IdentifiersAreQuotedOnCommandLine => false;
+
+        public virtual int? CompareVersions(string versionA, string versionB)
+        {
+            var parsedA = CoreTools.VersionStringToStruct(versionA);
+            var parsedB = CoreTools.VersionStringToStruct(versionB);
+
+            if (parsedA == CoreTools.Version.Null || parsedB == CoreTools.Version.Null)
+                return null;
+
+            return parsedA.CompareTo(parsedB);
+        }
+
         private readonly bool _baseConstructorCalled;
         private bool _ready;
 
@@ -66,6 +81,17 @@ namespace UniGetUI.PackageEngine.ManagerClasses.Manager
             out string callArguments
         );
         protected abstract void _loadManagerVersion(out string version);
+
+        /// <summary>
+        /// The argument vector that precedes the operation parameters, for managers whose command
+        /// line must be built with <see cref="System.Diagnostics.ProcessStartInfo.ArgumentList"/>
+        /// instead of a single concatenated string. An empty vector selects the concatenated
+        /// <see cref="ManagerStatus.ExecutableCallArgs"/> path.
+        /// </summary>
+        protected virtual IReadOnlyList<string> _getOperationCallArgs(
+            string executablePath,
+            string callArguments
+        ) => [];
 
         protected virtual void _performPreInitializationSteps() { }
 
@@ -92,6 +118,16 @@ namespace UniGetUI.PackageEngine.ManagerClasses.Manager
                     out string path,
                     out string callArguments
                 );
+
+                if (_recordDefaultEnabledState(found))
+                {
+                    Status = new() { Version = CoreTools.Translate("{0} is disabled", DisplayName) };
+                    Logger.ImportantInfo(
+                        $"{Name} was not found on the system and has been disabled by default"
+                    );
+                    return;
+                }
+
                 Status = new ManagerStatus();
                 Status.Found = found;
                 Status.ExecutablePath = path;
@@ -108,6 +144,8 @@ namespace UniGetUI.PackageEngine.ManagerClasses.Manager
                 }
 
                 Logger.ImportantInfo($"{Name} is enabled and was found on {path}");
+
+                Status.OperationCallArgs = _getOperationCallArgs(path, callArguments);
 
                 // Load manager version
                 _loadManagerVersion(out string version);
@@ -252,12 +290,43 @@ namespace UniGetUI.PackageEngine.ManagerClasses.Manager
             }
         }
 
+        protected bool IsUserSelectedExecutablePath(string path)
+        {
+            if (!SecureSettings.Get(SecureSettings.K.AllowCustomManagerPaths))
+            {
+                return false;
+            }
+
+            string? exeSelection = Settings.GetDictionaryItem<string, string>(
+                Settings.K.ManagerPaths,
+                Name
+            );
+
+            return !string.IsNullOrEmpty(exeSelection)
+                && File.Exists(exeSelection)
+                && exeSelection.Equals(path, StringComparison.OrdinalIgnoreCase);
+        }
+
         /// <summary>
         /// Returns true if the manager is enabled, false otherwise
         /// </summary>
         public bool IsEnabled()
         {
             return !Settings.GetDictionaryItem<string, bool>(Settings.K.DisabledManagers, Name);
+        }
+
+        private static readonly object _defaultEnabledStateLock = new();
+
+        private bool _recordDefaultEnabledState(bool found)
+        {
+            lock (_defaultEnabledStateLock)
+            {
+                if (Settings.DictionaryContainsKey<string, bool>(Settings.K.DisabledManagers, Name))
+                    return false;
+
+                Settings.SetDictionaryItem(Settings.K.DisabledManagers, Name, !found);
+                return !found;
+            }
         }
 
         /// <summary>
@@ -435,7 +504,10 @@ namespace UniGetUI.PackageEngine.ManagerClasses.Manager
             }
             try
             {
-                RefreshPackageIndexesSafely();
+                if (!SecondAttempt)
+                {
+                    RefreshPackageIndexesSafely();
+                }
 
                 var packages = RunListingTaskWithTimeout(
                     GetAvailableUpdates_UnSafe,
@@ -473,6 +545,13 @@ namespace UniGetUI.PackageEngine.ManagerClasses.Manager
         /// This method is fail-safe and will return an empty array if an error occurs.
         /// </summary>
         public bool LastInstalledListingFailed { get; private set; }
+
+        private long _installedPackagesGeneration;
+
+        public long InstalledPackagesGeneration => Volatile.Read(ref _installedPackagesGeneration);
+
+        public void InvalidateInstalledPackages() =>
+            Interlocked.Increment(ref _installedPackagesGeneration);
 
         public IReadOnlyList<IPackage> GetInstalledPackages()
         {

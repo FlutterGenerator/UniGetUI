@@ -12,6 +12,12 @@ public interface IKeyboardShortcutListener
     void DetailsTriggered();
 }
 
+public interface IDetailsPaneHost
+{
+    bool CanToggleDetailsPane { get; }
+    void ToggleDetailsPane();
+}
+
 /// <summary>
 /// Implemented by pages that have enter/leave lifecycle events.
 /// Mirrors UniGetUI.Pages.PageInterfaces.IEnterLeaveListener
@@ -20,6 +26,23 @@ public interface IEnterLeaveListener
 {
     void OnEnter();
     void OnLeave();
+}
+
+public enum PageLeaveReason
+{
+    Refresh,
+    NestedNavigation,
+    TopLevelNavigation,
+    Shutdown,
+}
+
+public interface IAsyncLeaveGuard
+{
+    bool HasUnsavedWork { get; }
+
+    Task<bool> CanLeaveAsync(
+        PageLeaveReason reason,
+        CancellationToken cancellationToken = default);
 }
 
 /// <summary>
@@ -40,5 +63,5 @@ public interface ISearchBoxPage
 public interface IInnerNavigationPage
 {
     bool CanGoBack();
-    void GoBack();
+    Task<bool> GoBackAsync(CancellationToken cancellationToken = default);
 }

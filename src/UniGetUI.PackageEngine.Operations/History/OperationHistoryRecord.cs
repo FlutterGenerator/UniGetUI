@@ -38,6 +38,12 @@ public sealed class OperationHistoryRecord
     public string OptionsJson { get; set; } = "";
     /// <summary>Process exit code, when the operation ran a process (null otherwise).</summary>
     public int? ExitCode { get; set; }
+    /// <summary>
+    /// Whether the operation actually ran elevated, for package operations. Null on records
+    /// written before this was tracked, and for operations that never ran a process.
+    /// </summary>
+    public bool? RanElevated { get; set; }
+    public bool SystemRestartRequired { get; set; }
     /// <summary>Short human-readable reason, derived from the last error line (mainly for failures).</summary>
     public string FailureSummary { get; set; } = "";
     public List<OperationHistoryOutputLine> Output { get; set; } = [];
@@ -69,6 +75,7 @@ public sealed class OperationHistoryRecord
             Role = (int)OperationType.None,
             Status = status,
             TimestampUtc = DateTime.UtcNow.ToString("O"),
+            SystemRestartRequired = op.SystemRestartRequired,
         };
 
         try
@@ -86,11 +93,17 @@ public sealed class OperationHistoryRecord
                     record.VersionBefore = pop.Role is OperationType.Install ? "" : pop.Package.VersionString;
                     record.VersionAfter = pop.Role switch
                     {
-                        OperationType.Update => pop.Package.NewVersionString,
                         OperationType.Uninstall => "",
+                        _ when pop.Options.Version is { Length: > 0 } pinnedVersion
+                            && (
+                                pop.Role is not OperationType.Update
+                                || pop.Package.Manager.Capabilities.SupportsCustomVersionsOnUpdate
+                            ) => pinnedVersion,
+                        OperationType.Update => pop.Package.NewVersionString,
                         _ => pop.Package.VersionString,
                     };
                     record.OptionsJson = pop.Options.AsJsonString();
+                    record.RanElevated = pop.WillRunElevated;
                     break;
                 case DownloadOperation dop:
                     record.PackageId = dop.Package.Id;

@@ -1,10 +1,11 @@
 using System.Collections.ObjectModel;
 using System.Net.Http;
 using System.Windows.Input;
+using Avalonia.Automation;
 using Avalonia.Media.Imaging;
-using Avalonia.Platform;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+using UniGetUI.Avalonia.Infrastructure;
 using UniGetUI.Avalonia.Views;
 using UniGetUI.Core.Language;
 using UniGetUI.Core.Logging;
@@ -12,9 +13,11 @@ using UniGetUI.Core.SettingsEngine;
 using UniGetUI.Core.SettingsEngine.SecureSettings;
 using UniGetUI.Core.Tools;
 using UniGetUI.Core.Tools.Scheduling;
+using UniGetUI.PackageEngine.AgentBroker;
 using UniGetUI.PackageEngine.Classes.Packages.Classes;
 using UniGetUI.PackageEngine.Enums;
 using UniGetUI.PackageEngine.Interfaces;
+using UniGetUI.PackageEngine.Operations;
 using UniGetUI.PackageEngine.PackageClasses;
 using UniGetUI.PackageEngine.Serializable;
 
@@ -48,6 +51,7 @@ public partial class InstallOptionsViewModel : ObservableObject
     public string ParamsUpdateLabel { get; } = CoreTools.Translate("Custom update arguments:");
     public string ParamsUninstallLabel { get; } = CoreTools.Translate("Custom uninstall arguments:");
     public string CliArgsHintLabel { get; } = CoreTools.Translate("These fields are independent: an argument set for Install won't apply to Update or Uninstall, and vice versa.");
+    public string LocationPlaceholderHintLabel { get; } = CoreTools.Translate("%PACKAGE% is replaced with the package ID, and %NAME% with the package name.");
     public string EnvVarSyntaxHintLabel { get; } = Settings.Get(Settings.K.ExpandEnvVarsWithPercentSyntax)
         ? CoreTools.Translate("Environment variables use %VARIABLE% syntax.")
         : CoreTools.Translate("Environment variables use <VARIABLE> syntax.");
@@ -75,6 +79,15 @@ public partial class InstallOptionsViewModel : ObservableObject
     public string TabCloseAppsLine2 { get; } = CoreTools.Translate("before installing");
     public string TabPrePostLine1 { get; } = CoreTools.Translate("Pre-install");
     public string TabPrePostLine2 { get; } = CoreTools.Translate("Post-install");
+
+    // Combined accessible names for the tab headers: screen readers announce the
+    // whole tab title, and the second line often carries essential information
+    // (for example "Pre-install — Post-install").
+    public string TabGeneralName { get; } = $"{CoreTools.Translate("General")} — {CoreTools.Translate("Version")}";
+    public string TabLocationName { get; } = $"{CoreTools.Translate("Architecture")} — {CoreTools.Translate("Location and Scope")}";
+    public string TabCLIName { get; } = $"{CoreTools.Translate("Command-line")} — {CoreTools.Translate("Arguments")}";
+    public string TabCloseAppsName { get; } = $"{CoreTools.Translate("Close apps")} — {CoreTools.Translate("before installing")}";
+    public string TabPrePostName { get; } = $"{CoreTools.Translate("Pre-install")} — {CoreTools.Translate("Post-install")}";
 
     // Close-apps tab labels
     public string KillProcessesDescriptionLabel { get; } = CoreTools.Translate(
@@ -159,6 +172,9 @@ public partial class InstallOptionsViewModel : ObservableObject
     [ObservableProperty] private bool _versionEnabled;
     public ObservableCollection<string> VersionOptions { get; } = [];
     [ObservableProperty] private string? _selectedVersion;
+    [ObservableProperty] private bool _versionIsTyped;
+    [ObservableProperty] private string _typedVersion = "";
+    public string TypedVersionPlaceholder { get; } = CoreTools.Translate("Latest");
 
     [ObservableProperty] private bool _skipMinorChecked;
     // Index 0 => keep first 1 number significant (level 2), 1 => first 2 (level 3), 2 => first 3 (level 4).
@@ -178,6 +194,7 @@ public partial class InstallOptionsViewModel : ObservableObject
     partial void OnInteractiveCheckedChanged(bool value) => Refresh();
     partial void OnSkipHashCheckedChanged(bool value) => Refresh();
     partial void OnSelectedVersionChanged(string? value) => Refresh();
+    partial void OnTypedVersionChanged(string value) => Refresh();
 
     // ── Architecture / Scope / Location tab ───────────────────────────────────
     [ObservableProperty] private bool _archEnabled;
@@ -193,6 +210,25 @@ public partial class InstallOptionsViewModel : ObservableObject
 
     partial void OnSelectedArchChanged(string? value) => Refresh();
     partial void OnSelectedScopeChanged(string? value) => Refresh();
+    partial void OnLocationTextChanged(string value) => Refresh();
+
+    // ── Package broker notices ────────────────────────────────────────────────
+    /// <summary>Why the Devolutions Agent would reject the current options, one item per line.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(BrokerIssuesVisible))]
+    private string _brokerIssuesText = "";
+
+    public bool BrokerIssuesVisible => BrokerIssuesText.Length > 0;
+
+    public string BrokerIssuesHeaderLabel { get; } = CoreTools.Translate(
+        "These options cannot be used through the Devolutions Agent, which will refuse the operation:");
+
+    /// <summary>Warning about custom WinGet arguments when the operation goes through the Devolutions Agent.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(BrokerCustomArgumentsWarningVisible))]
+    private string _brokerCustomArgumentsWarning = "";
+
+    public bool BrokerCustomArgumentsWarningVisible => BrokerCustomArgumentsWarning.Length > 0;
 
     // ── CLI params tab ────────────────────────────────────────────────────────
     [ObservableProperty] private string _paramsInstall = "";
@@ -216,6 +252,12 @@ public partial class InstallOptionsViewModel : ObservableObject
     [ObservableProperty] private string _postUninstallText = "";
     [ObservableProperty] private bool _abortUninstall;
 
+    partial void OnPreInstallTextChanged(string value) => Refresh();
+    partial void OnPostInstallTextChanged(string value) => Refresh();
+    partial void OnPreUpdateTextChanged(string value) => Refresh();
+    partial void OnPostUpdateTextChanged(string value) => Refresh();
+    partial void OnPreUninstallTextChanged(string value) => Refresh();
+    partial void OnPostUninstallTextChanged(string value) => Refresh();
     // ── Close apps tab ────────────────────────────────────────────────────────
     public ObservableCollection<KillProcessEntry> KillProcessEntries { get; } = [];
 
@@ -297,6 +339,8 @@ public partial class InstallOptionsViewModel : ObservableObject
             ? CoreTools.Translate("PreRelease")
             : CoreTools.Translate("Latest");
         VersionEnabled = caps.SupportsCustomVersions || caps.SupportsPreRelease;
+        VersionIsTyped = caps.SupportsCustomVersions && !caps.CanListVersions;
+        TypedVersion = options.Version;
 
         // Architecture
         string defaultLabel = CoreTools.Translate("Default");
@@ -349,14 +393,15 @@ public partial class InstallOptionsViewModel : ObservableObject
         // Close apps
         foreach (var proc in options.KillBeforeOperation)
             KillProcessEntries.Add(new KillProcessEntry(proc, e => KillProcessEntries.Remove(e)));
+        // Close-app entries are part of the brokered request, so changes re-check its rules.
+        KillProcessEntries.CollectionChanged += (_, _) => Refresh();
         ForceKillChecked = Settings.Get(Settings.K.KillProcessesThatRefuseToDie);
 
         // Show fallback immediately, then replace with real icon if available
-        using var fallback = AssetLoader.Open(_fallbackIconUri);
-        PackageIcon = new Bitmap(fallback);
+        PackageIcon = BitmapLoader.TryLoadAsset(_fallbackIconUri);
         _ = LoadIconAsync();
 
-        if (caps.SupportsCustomVersions)
+        if (caps.SupportsCustomVersions && caps.CanListVersions)
             _ = LoadVersionsAsync(options.Version);
 
         _ = LoadIgnoredUpdatesAsync();
@@ -497,8 +542,105 @@ public partial class InstallOptionsViewModel : ObservableObject
     private async Task RefreshCommandPreviewAsync()
     {
         if (!_uiLoaded) return;
-        CommandPreview = await BuildCurrentCommandAsync();
+        // Edits start overlapping refreshes; only the latest one may publish its results.
+        int generation = Interlocked.Increment(ref _refreshGeneration);
+        string command = await BuildCurrentCommandAsync();
+        if (generation != _refreshGeneration) return;
+        CommandPreview = command;
+        await RefreshBrokerNoticesAsync(generation);
     }
+
+    /// <summary>
+    /// When the operation goes through the Devolutions Agent, explains the options it would
+    /// reject and warns about custom WinGet installer arguments, using the same rules as the
+    /// request builder so the user can fix them before starting the operation.
+    /// </summary>
+    private int _refreshGeneration;
+
+    private async Task RefreshBrokerNoticesAsync(int generation)
+    {
+        if (!IsBrokered(_package))
+        {
+            BrokerIssuesText = "";
+            BrokerCustomArgumentsWarning = "";
+            return;
+        }
+
+        var op = CurrentOp();
+        string issuesText;
+        string customArgumentsWarning;
+        try
+        {
+            var applied = await InstallOptionsFactory.LoadApplicableAsync(_package, overridePackageOptions: SnapshotOptions());
+            // Resolve the location exactly as the brokered operation will (for WinGet updates
+            // this may be the registry-detected location rather than the configured one).
+            var issues = await Task.Run(() =>
+            {
+                // Apply the manager's own elevation requirements first, as the brokered
+                // operation does (e.g. a WinGet installer that must run elevated).
+                _package.Manager.OperationHelper.ApplyElevationRequirements(_package, applied, op);
+                return BrokerRequestBuilder.FindProblems(
+                    _package,
+                    applied,
+                    op,
+                    PackageOperation.GetBrokerInstallLocation(_package, applied, op));
+            });
+            issuesText = string.Join(Environment.NewLine, issues.Select(issue => "• " + issue));
+            customArgumentsWarning = DescribeBrokerCustomArgumentsRisk(applied, op);
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"[InstallOptionsViewModel] Could not check the options against the package broker rules: {ex.Message}");
+            issuesText = "";
+            customArgumentsWarning = "";
+        }
+
+        if (generation != _refreshGeneration)
+            return;
+
+        // Assigning bound text is not reliably announced, so route changes through the app's
+        // live region. Assigning an unchanged value is a no-op, which suppresses repeats.
+        if (issuesText != BrokerIssuesText && issuesText.Length > 0)
+            AccessibilityAnnouncementService.Announce(
+                $"{BrokerIssuesHeaderLabel} {issuesText}",
+                AutomationLiveSetting.Assertive);
+        if (customArgumentsWarning != BrokerCustomArgumentsWarning && customArgumentsWarning.Length > 0)
+            AccessibilityAnnouncementService.Announce(customArgumentsWarning, AutomationLiveSetting.Polite);
+
+        BrokerIssuesText = issuesText;
+        BrokerCustomArgumentsWarning = customArgumentsWarning;
+    }
+
+    private string DescribeBrokerCustomArgumentsRisk(InstallOptions applied, OperationType op)
+    {
+        if (!_package.Manager.Name.Equals("Winget", StringComparison.OrdinalIgnoreCase))
+            return "";
+
+        if (BrokerRequestValidator.UsesWinGetInstallerArguments(_package, applied, op))
+            return CoreTools.Translate(
+                "--override and --custom pass arbitrary arguments to the package installer. Through the Devolutions Agent, the installer can run with administrator rights, so your organization's policy may block these arguments.");
+
+        List<string> parameters = op switch
+        {
+            OperationType.Update => applied.CustomParameters_Update,
+            OperationType.Uninstall => applied.CustomParameters_Uninstall,
+            _ => applied.CustomParameters_Install,
+        };
+
+        // Same elevation predicate as the brokered operation: the package's own requirement
+        // (e.g. a WinGet installer that needs elevation) counts as well as the checkbox.
+        bool runsElevated = BrokerRequestValidator.RequestsElevation(_package, applied);
+
+        return parameters.Any(parameter => !string.IsNullOrWhiteSpace(parameter)) && runsElevated
+            ? CoreTools.Translate(
+                "Custom arguments are passed to WinGet by the Devolutions Agent, which runs this operation with administrator rights. Your organization's policy may block custom arguments.")
+            : "";
+    }
+
+    private static bool IsBrokered(IPackage package) =>
+        Settings.Get(Settings.K.UseAgentBroker)
+        && BrokerRequestBuilder.SupportsManager(package.Manager.Name)
+        && !package.Source.IsVirtualManager;
 
     /// <summary>Builds the CLI command for the currently selected operation and options,
     /// identical to the live preview. Used by the Copy / Open-in-terminal actions.</summary>
@@ -507,8 +649,17 @@ public partial class InstallOptionsViewModel : ObservableObject
         var snap = SnapshotOptions();
         var op = CurrentOp();
         var applied = await InstallOptionsFactory.LoadApplicableAsync(_package, overridePackageOptions: snap);
-        var args = await Task.Run(() => _package.Manager.OperationHelper.GetParameters(_package, applied, op));
-        return _package.Manager.Properties.ExecutableFriendlyName + " " + string.Join(' ', args);
+        try
+        {
+            var args = await Task.Run(() =>
+                _package.Manager.OperationHelper.GetStandaloneParameters(_package, applied, op));
+            return _package.Manager.Properties.ExecutableFriendlyName + " " + string.Join(' ', args);
+        }
+        catch (InvalidOperationException ex)
+        {
+            Logger.Warn($"[InstallOptionsViewModel] No command line for {_package.Id}: {ex.Message}");
+            return "";
+        }
     }
 
     private void Refresh() { if (_uiLoaded) _ = RefreshCommandPreviewAsync(); }
@@ -528,7 +679,7 @@ public partial class InstallOptionsViewModel : ObservableObject
 
             Bitmap bmp;
             if (uri.IsFile)
-                bmp = new Bitmap(uri.LocalPath);
+                bmp = BitmapLoader.LoadFile(uri.LocalPath);
             else if (uri.Scheme is "http" or "https")
             {
                 var bytes = await _iconHttp.GetByteArrayAsync(uri);
@@ -581,6 +732,8 @@ public partial class InstallOptionsViewModel : ObservableObject
         var ver = SelectedVersion ?? "";
         o.PreRelease = ver == CoreTools.Translate("PreRelease");
         o.Version = (ver != CoreTools.Translate("Latest") && ver != CoreTools.Translate("PreRelease") && ver.Length > 0) ? ver : "";
+        if (VersionIsTyped)
+            o.Version = TypedVersion.Trim();
 
         string defaultLabel = CoreTools.Translate("Default");
         o.Architecture = (SelectedArch != defaultLabel && SelectedArch is not null) ? SelectedArch : "";
@@ -599,6 +752,7 @@ public partial class InstallOptionsViewModel : ObservableObject
         o.PreUninstallCommand = PreUninstallText;
         o.PostUninstallCommand = PostUninstallText;
         o.AbortOnPreUninstallFail = AbortUninstall;
+        o.KillBeforeOperation = KillProcessEntries.Select(e => e.Name).ToList();
         return o;
     }
 

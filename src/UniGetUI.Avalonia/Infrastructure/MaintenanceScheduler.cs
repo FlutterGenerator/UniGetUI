@@ -3,6 +3,7 @@ using UniGetUI.Avalonia.ViewModels.Pages.SettingsPages;
 using UniGetUI.Core.Logging;
 using UniGetUI.Core.Tools.Scheduling;
 using UniGetUI.PackageEngine.PackageLoader;
+using UniGetUI.PackageOperations;
 
 namespace UniGetUI.Avalonia.Infrastructure;
 
@@ -82,6 +83,15 @@ internal static class MaintenanceScheduler
 
     public static void MarkAutoInstallHandled() => _pendingInstallSince = null;
 
+    public static bool IsAnyTaskRunning
+    {
+        get
+        {
+            lock (RunningTasks)
+                return RunningTasks.Count > 0;
+        }
+    }
+
     public static bool ShouldRunAtAppStart(MaintenanceTaskKind kind)
     {
         var schedule = MaintenanceScheduleStore.Get(kind);
@@ -96,6 +106,7 @@ internal static class MaintenanceScheduler
                 return;
         }
 
+        await AbstractOperation.BeginWorkAsync();
         DateTime? previousRun = MaintenanceScheduleStore.GetLastRun(kind);
         bool abandoned = false;
 
@@ -126,6 +137,7 @@ internal static class MaintenanceScheduler
         }
         finally
         {
+            AbstractOperation.EndWork();
             if (!abandoned)
             {
                 lock (RunningTasks)

@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using System.Text;
+using System.Text.Json;
 using UniGetUI.Core.Data;
 using UniGetUI.Core.Logging;
 using UniGetUI.Core.Tools;
@@ -11,7 +12,7 @@ namespace UniGetUI.Avalonia;
 public static class CrashHandler
 {
     public static readonly string PendingCrashFile =
-        Path.Combine(Path.GetTempPath(), "UniGetUI_pending_crash.txt");
+        Path.Combine(AppPaths.ScratchDirectory, "pending_crash.txt");
 
     private const string NO_CORRUPT_DIALOG = "--no-corrupt-dialog";
 
@@ -90,16 +91,64 @@ public static class CrashHandler
         }
     }
 
+    private static readonly string[] KnownBundledLibraries =
+        ["libSkiaSharp", "libHarfBuzzSharp", "av_libglesv2", "e_sqlite3"];
+
+    internal static bool IsMissingBundledLibrary(Exception exception)
+        => IsMissingBundledLibrary(exception, ReadShippedLibraries());
+
+    internal static bool IsMissingBundledLibrary(Exception exception, IEnumerable<string> shippedFiles)
+    {
+        if (exception is not DllNotFoundException)
+            return false;
+
+        string message = exception.Message;
+        int start = message.IndexOf('\'');
+        int end = start < 0 ? -1 : message.IndexOf('\'', start + 1);
+        if (end <= start + 1)
+            return false;
+
+        string library = LibraryName(message[(start + 1)..end]);
+        return KnownBundledLibraries.Concat(shippedFiles)
+            .Any(file => LibraryName(file).Equals(library, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string LibraryName(string path)
+    {
+        string name = Path.GetFileName(path.Trim());
+        return name.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) ? name[..^4] : name;
+    }
+
+    private static List<string> ReadShippedLibraries()
+    {
+        try
+        {
+            string tree = Path.Join(CoreData.UniGetUIExecutableDirectory, "IntegrityTree.json");
+            if (!File.Exists(tree))
+                return [];
+
+            using JsonDocument document = JsonDocument.Parse(File.ReadAllText(tree));
+            return document.RootElement.EnumerateObject()
+                .Select(entry => entry.Name)
+                .Where(name => name.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
     public static void ReportFatalException(Exception e)
     {
         Debugger.Break();
 
-        if (OperatingSystem.IsWindows() && !Environment.GetCommandLineArgs().Contains(NO_CORRUPT_DIALOG))
+        if (OperatingSystem.IsWindows() && !CoreData.GetProcessArguments().Contains(NO_CORRUPT_DIALOG))
         {
             Exception? fileEx = e;
             while (fileEx is not null)
             {
-                if ((uint)fileEx.HResult is 0x80070002 or 0x8007007E or 0x802B000A)
+                if (IsMissingBundledLibrary(fileEx) || (uint)fileEx.HResult is 0x80070002 or 0x8007007E or 0x802B000A)
                 {
                     _reportMissingFiles(out bool showDetailedReport);
                     if (!showDetailedReport)
@@ -223,6 +272,7 @@ public static class CrashHandler
         // Persist crash data so the next normal app launch can show the report.
         try
         {
+            Directory.CreateDirectory(Path.GetDirectoryName(PendingCrashFile)!);
             File.WriteAllText(PendingCrashFile, Error_String, Encoding.UTF8);
         }
         catch

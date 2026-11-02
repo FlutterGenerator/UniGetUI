@@ -7,13 +7,17 @@ using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Avalonia.Controls;
 using Avalonia.Threading;
 using Microsoft.Win32;
 using UniGetUI.Avalonia.ViewModels;
+using UniGetUI.Avalonia.Views;
 using UniGetUI.Core.Data;
 using UniGetUI.Core.Logging;
 using UniGetUI.Core.SettingsEngine;
 using UniGetUI.Core.Tools;
+using UniGetUI.PackageOperations;
+using UniGetUI.Shared;
 
 namespace UniGetUI.Avalonia.Infrastructure;
 
@@ -84,7 +88,8 @@ internal static partial class AvaloniaAutoUpdater
         InfoBarSeverity Severity,
         bool IsClosable,
         string? ActionButtonText = null,
-        Action? ActionButtonAction = null);
+        Action? ActionButtonAction = null,
+        bool IsOpen = true);
 
     private static void RaiseStatus(
         string title,
@@ -98,6 +103,12 @@ internal static partial class AvaloniaAutoUpdater
         Dispatcher.UIThread.Post(() => StatusChanged?.Invoke(info));
     }
 
+    private static void DismissUpdateBanner()
+    {
+        var info = new UpdateStatusInfo("", "", InfoBarSeverity.Informational, IsClosable: true, IsOpen: false);
+        Dispatcher.UIThread.Post(() => StatusChanged?.Invoke(info));
+    }
+
     // ------------------------------------------------------------------ per-attempt log
     // Captures auto-updater log entries for the current update attempt. We keep a
     // dedicated buffer (in addition to the global session log) so the "View log"
@@ -106,8 +117,7 @@ internal static partial class AvaloniaAutoUpdater
     private static readonly Lock _updateLogLock = new();
     private static StringBuilder? _updateLogBuilder;
     private static readonly string _updateLogPath = Path.Combine(
-        Path.GetTempPath(),
-        "UniGetUI",
+        AppPaths.ScratchDirectory,
         "last-update-attempt.log"
     );
 
@@ -194,6 +204,7 @@ internal static partial class AvaloniaAutoUpdater
     {
         try
         {
+            if (IsDefaultDevVersion(CoreData.VersionName)) return;
             if (!File.Exists(_updateLogPath)) return;
 
             var info = new FileInfo(_updateLogPath);
@@ -203,6 +214,30 @@ internal static partial class AvaloniaAutoUpdater
             string content = File.ReadAllText(_updateLogPath);
             if (content.Contains(AttemptFinishedMarker))
                 return;
+
+            if (MacUpdateTargetResolver.TryGetSwapFailure(content, out string failedBundle))
+            {
+                Logger.Warn($"The previous update could not replace {failedBundle}.");
+                try
+                {
+                    File.AppendAllText(
+                        _updateLogPath,
+                        $"{Environment.NewLine}{AttemptFinishedMarker} bundle swap failed (detected on next launch) at {DateTime.Now:yyyy-MM-dd HH:mm:ss} ==={Environment.NewLine}");
+                }
+                catch (Exception ex)
+                {
+                    Logger.Warn($"Could not mark the failed update attempt as finished: {ex.Message}");
+                }
+
+                RaiseStatus(
+                    CoreTools.Translate("The update could not be applied."),
+                    CoreTools.Translate("UniGetUI could not replace {0}, so it is still running the previous version. Open the log to see what happened.", failedBundle),
+                    InfoBarSeverity.Error,
+                    isClosable: true,
+                    actionButtonText: CoreTools.Translate("View log"),
+                    actionButtonAction: OpenUpdateLog);
+                return;
+            }
 
             string currentVer = CoreData.VersionName;
             string? targetVer = null;
@@ -328,7 +363,10 @@ internal static partial class AvaloniaAutoUpdater
         _ => CoreTools.Translate("Unexpected installer error."),
     };
 
+    private static readonly TimeSpan IdleSampleInterval = TimeSpan.FromSeconds(5);
     private static volatile bool _installRequested;
+    private static readonly HashSet<string> _backgroundInstallTriedVersions = [];
+    private static readonly string[] UniGetUIProcessNames = ["UniGetUI", "uniget", "UniGetUI.Avalonia", "WingetUI"];
     private static string? _pendingInstallerPath;
 
     /// <summary>
@@ -361,6 +399,14 @@ internal static partial class AvaloniaAutoUpdater
             return;
         }
 
+        if (IsDefaultDevVersion(CoreData.VersionName))
+        {
+            LogUpdateInfo(
+                $"Auto-updater: default dev version ({CoreData.VersionName}) detected, skipping update check."
+            );
+            return;
+        }
+
         await CoreTools.WaitForInternetConnection();
 
         bool isFirstLaunch = true;
@@ -379,16 +425,91 @@ internal static partial class AvaloniaAutoUpdater
         }
     }
 
-    // ------------------------------------------------------------------ core logic
-    internal static async Task<bool> CheckAndInstallUpdatesAsync(bool autoLaunch = false, bool manualCheck = false)
+    private static int _activeAttempts;
+    private static int _attemptsAwaitingConsent;
+    private static readonly AutoUpdaterHelpers.UpdaterAttemptCoordinator AttemptCoordinator = new();
+    private static readonly InstallerHandoffTracker InstallerHandoffs = new();
+    private static readonly TimeSpan InstallerHandoffTimeout = TimeSpan.FromMinutes(2);
+
+    internal static bool IsBusy
+        => Volatile.Read(ref _activeAttempts) > Volatile.Read(ref _attemptsAwaitingConsent);
+
+    internal static async Task WaitForInstallerHandoffAsync()
     {
-        ResetUpdateLog(manualCheck, autoLaunch);
+        if (!InstallerHandoffs.HasPending)
+            return;
+
+        LogUpdateInfo("Auto-updater: waiting for the ready update to be handed off before shutting down.");
+        if (!await InstallerHandoffs.WaitForAllAsync(InstallerHandoffTimeout))
+            LogUpdateWarn($"Auto-updater: the ready update was not handed off within {InstallerHandoffTimeout.TotalMinutes:0} minutes, shutting down anyway.");
+    }
+
+    // ------------------------------------------------------------------ core logic
+    internal static void CancelObsoletePendingUpdateForChannelChange()
+    {
+        AttemptCoordinator.CancelIfChannelMismatch(Settings.Get(Settings.K.EnableUniGetUIBeta));
+    }
+
+    internal static Task<bool> CheckAndInstallUpdatesAsync(bool autoLaunch = false, bool manualCheck = false)
+    {
+        bool useBeta = Settings.Get(Settings.K.EnableUniGetUIBeta);
+        return AttemptCoordinator.RunOrJoinAsync(
+            manualCheck,
+            useBeta,
+            attempt => RunSingleAttemptAsync(attempt, autoLaunch, manualCheck),
+            onJoinedActiveAttempt: () =>
+                LogUpdateInfo("Auto-updater: an update attempt is already in progress; reusing active attempt."),
+            onManualJoinWhileAwaitingConsent: versionName =>
+                Dispatcher.UIThread.Post(() => UpdateAvailable?.Invoke(versionName)),
+            onManualJoinWhileBusy: () =>
+                RaiseStatus(
+                    CoreTools.Translate("We are checking for updates."),
+                    CoreTools.Translate("Please wait"),
+                    InfoBarSeverity.Informational,
+                    isClosable: false)
+        );
+    }
+
+    private static async Task<bool> RunSingleAttemptAsync(
+        AutoUpdaterHelpers.UpdaterAttemptCoordinator.AttemptScope attempt,
+        bool autoLaunch,
+        bool manualCheck)
+    {
+        Interlocked.Increment(ref _activeAttempts);
+        try
+        {
+            return await CheckAndInstallUpdatesCoreAsync(attempt, autoLaunch, manualCheck);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _activeAttempts);
+        }
+    }
+
+    private static async Task<bool> CheckAndInstallUpdatesCoreAsync(
+        AutoUpdaterHelpers.UpdaterAttemptCoordinator.AttemptScope attempt,
+        bool autoLaunch,
+        bool manualCheck)
+    {
+        bool IsManual() => manualCheck || attempt.IsManualCheck;
+        bool IsChannelObsolete() =>
+            attempt.IsSuperseded || Settings.Get(Settings.K.EnableUniGetUIBeta) != attempt.UseBeta;
+
+        if (IsDefaultDevVersion(CoreData.VersionName))
+        {
+            LogUpdateInfo(
+                $"Auto-updater: default dev version ({CoreData.VersionName}) detected, skipping update check."
+            );
+            return true;
+        }
+
+        ResetUpdateLog(IsManual(), autoLaunch);
         UpdaterOverrides overrides = LoadUpdaterOverrides();
         bool wasCheckingForUpdates = true;
 
         try
         {
-            if (manualCheck)
+            if (IsManual())
             {
                 RaiseStatus(
                     CoreTools.Translate("We are checking for updates."),
@@ -397,14 +518,22 @@ internal static partial class AvaloniaAutoUpdater
                     isClosable: false);
             }
 
-            UpdateCandidate candidate = await GetUpdateCandidateAsync(overrides);
+            UpdateCandidate candidate = await GetUpdateCandidateAsync(overrides, attempt.UseBeta);
+            if (IsChannelObsolete())
+            {
+                LogUpdateInfo("Auto-updater: update channel changed while checking for updates \u2014 aborting obsolete attempt.");
+                DismissUpdateBanner();
+                MarkAttemptFinished("aborted - update channel changed");
+                return true;
+            }
+
             LogUpdateInfo(
                 $"Auto-updater source '{candidate.SourceName}' returned version {candidate.VersionName} (upgradable={candidate.IsUpgradable})"
             );
 
             if (!candidate.IsUpgradable)
             {
-                if (manualCheck)
+                if (IsManual())
                 {
                     RaiseStatus(
                         CoreTools.Translate("Great! You are on the latest version."),
@@ -419,6 +548,11 @@ internal static partial class AvaloniaAutoUpdater
             wasCheckingForUpdates = false;
             RecordTargetVersion(candidate.VersionName);
             LogUpdateInfo($"Update to UniGetUI {candidate.VersionName} is available.");
+
+            if (OperatingSystem.IsMacOS() && ReportMacUpdateTargetIfBlocked(ResolveMacUpdateTarget()))
+            {
+                return false;
+            }
 
             string installerName;
             if (OperatingSystem.IsWindows())
@@ -446,7 +580,7 @@ internal static partial class AvaloniaAutoUpdater
                     message => LogUpdateWarn(message)
                 );
                 LogUpdateInfo("Cached valid installer found, preparing to launch...");
-                return await PrepareAndLaunchAsync(installerPath, candidate.VersionName, autoLaunch, manualCheck);
+                return await PrepareAndLaunchAsync(attempt, installerPath, candidate.InstallerHash, candidate.VersionName, autoLaunch, IsManual());
             }
 
             string installerValidationFailureMarkerPath =
@@ -461,7 +595,7 @@ internal static partial class AvaloniaAutoUpdater
             }
 
             if (
-                !manualCheck
+                !IsManual()
                 && UpdaterDownloadEngine.IsFailureBackoffActive(
                     installerDownloadFailureStatePath,
                     installerIdentity,
@@ -526,7 +660,7 @@ internal static partial class AvaloniaAutoUpdater
                     message => LogUpdateWarn(message)
                 );
                 LogUpdateInfo("Downloaded installer is valid, preparing to launch...");
-                return await PrepareAndLaunchAsync(installerPath, candidate.VersionName, autoLaunch, manualCheck);
+                return await PrepareAndLaunchAsync(attempt, installerPath, candidate.InstallerHash, candidate.VersionName, autoLaunch, IsManual());
             }
 
             UpdaterDownloadEngine.RecordFailure(
@@ -550,7 +684,7 @@ internal static partial class AvaloniaAutoUpdater
                 actionButtonText: CoreTools.Translate("View log"),
                 actionButtonAction: OpenUpdateLog);
             MarkAttemptFinished("authenticity verification failed");
-            return !manualCheck;
+            return !IsManual();
         }
         catch (PlatformArtifactMissingException ex)
         {
@@ -558,7 +692,7 @@ internal static partial class AvaloniaAutoUpdater
             // published for the current OS/arch yet. Surface this as a friendly
             // "manual update required" notice rather than a generic error.
             LogUpdateWarn(ex.Message);
-            if (manualCheck)
+            if (IsManual())
             {
                 RaiseStatus(
                     CoreTools.Translate("Auto-update is not yet available on this platform."),
@@ -573,7 +707,7 @@ internal static partial class AvaloniaAutoUpdater
         {
             LogUpdateError("An error occurred while checking for updates:");
             LogUpdateError(ex);
-            if (manualCheck || !wasCheckingForUpdates)
+            if (IsManual() || !wasCheckingForUpdates)
             {
                 RaiseStatus(
                     CoreTools.Translate("An error occurred when checking for updates: "),
@@ -617,11 +751,24 @@ internal static partial class AvaloniaAutoUpdater
     }
 
     private static async Task<bool> PrepareAndLaunchAsync(
+        AutoUpdaterHelpers.UpdaterAttemptCoordinator.AttemptScope attempt,
         string installerPath,
+        string installerHash,
         string versionName,
         bool autoLaunch,
         bool manualCheck)
     {
+        bool IsChannelObsolete() =>
+            attempt.IsSuperseded || Settings.Get(Settings.K.EnableUniGetUIBeta) != attempt.UseBeta;
+
+        if (IsChannelObsolete())
+        {
+            LogUpdateInfo("Auto-updater: update channel changed before prompting user \u2014 aborting obsolete update.");
+            DismissUpdateBanner();
+            MarkAttemptFinished("aborted - update channel changed");
+            return true;
+        }
+
         _pendingInstallerPath = installerPath;
         _installRequested = false;
         ReleaseLockForAutoupdate_Notification = false;
@@ -638,28 +785,186 @@ internal static partial class AvaloniaAutoUpdater
             // On first launch in background we wait for user interaction
         }
 
-        // Wait until user requests install, clicks the toast, or the window is being closed
-        while (!_installRequested && !ReleaseLockForAutoupdate_Window && !ReleaseLockForAutoupdate_Notification)
+        bool installingInBackground = false;
+        TaskCompletionSource handoff = InstallerHandoffs.Begin();
+        try
         {
-            if (!manualCheck && Settings.Get(Settings.K.DisableAutoUpdateWingetUI))
+            bool canInstallInBackground = OperatingSystem.IsWindows();
+            if (canInstallInBackground && BackgroundInstallNeedsElevation())
             {
-                LogUpdateWarn("Auto-updater: disabled while waiting for user \u2014 aborting.");
-                MarkAttemptFinished("aborted - auto-update disabled while waiting");
-                return true;
+                if (Settings.Get(Settings.K.InstallUniGetUIUpdatesWhenIdle))
+                    LogUpdateWarn("Auto-updater: installing in the background needs a per-user installation or administrator rights — waiting for the user.");
+                canInstallInBackground = false;
             }
-            await Task.Delay(500);
-        }
+            else if (canInstallInBackground && WasBackgroundInstallTried(versionName))
+            {
+                if (Settings.Get(Settings.K.InstallUniGetUIUpdatesWhenIdle))
+                    LogUpdateWarn($"Auto-updater: installing {versionName} in the background was already tried once — waiting for the user.");
+                canInstallInBackground = false;
+            }
 
-        LogUpdateInfo("Installing update \u2014 launching installer.");
-        await LaunchInstallerAsync(installerPath);
-        return true;
+            while (true)
+            {
+                // Wait until user requests install, clicks the toast, or the window is being closed
+                attempt.MarkAwaitingConsent(versionName);
+                Interlocked.Increment(ref _attemptsAwaitingConsent);
+                try
+                {
+                    int idleChecks = 0;
+                    DateTime nextIdleSample = DateTime.UtcNow + IdleSampleInterval;
+
+                    while (!_installRequested && !ReleaseLockForAutoupdate_Window && !ReleaseLockForAutoupdate_Notification)
+                    {
+                        if (IsChannelObsolete())
+                        {
+                            LogUpdateInfo("Auto-updater: update channel changed while waiting for user — aborting.");
+                            DismissUpdateBanner();
+                            MarkAttemptFinished("aborted - update channel changed while waiting");
+                            return true;
+                        }
+
+                        if (!manualCheck && !attempt.IsManualCheck && Settings.Get(Settings.K.DisableAutoUpdateWingetUI))
+                        {
+                            LogUpdateWarn("Auto-updater: disabled while waiting for user — aborting.");
+                            DismissUpdateBanner();
+                            MarkAttemptFinished("aborted - auto-update disabled while waiting");
+                            return true;
+                        }
+
+                        if (canInstallInBackground && DateTime.UtcNow >= nextIdleSample)
+                        {
+                            nextIdleSample = DateTime.UtcNow + IdleSampleInterval;
+                            if (!Settings.Get(Settings.K.InstallUniGetUIUpdatesWhenIdle))
+                            {
+                                idleChecks = 0;
+                            }
+                            else
+                            {
+                                bool otherInstanceRunning = AnotherUniGetUIProcessIsRunning();
+                                if (await Dispatcher.UIThread.InvokeAsync(() =>
+                                    {
+                                        if (!IdleSelfUpdateGate.ShouldInstall(SampleIdleState(otherInstanceRunning), ref idleChecks))
+                                            return false;
+                                        if (AbstractOperation.TryHoldNewOperations())
+                                            return true;
+                                        idleChecks = 0;
+                                        return false;
+                                    }))
+                                {
+                                    LogUpdateInfo("Auto-updater: UniGetUI is idle in the background — installing the update without waiting for the user.");
+                                    installingInBackground = true;
+                                    MarkBackgroundInstallTried(versionName);
+                                    break;
+                                }
+                            }
+                        }
+
+                        try
+                        {
+                            await Task.Delay(500, attempt.ConsentCancellationToken);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            // Channel changed and superseded this pending-consent attempt.
+                        }
+                    }
+
+                    if (IsChannelObsolete())
+                    {
+                        LogUpdateInfo("Auto-updater: update channel changed while waiting for user — aborting.");
+                        DismissUpdateBanner();
+                        MarkAttemptFinished("aborted - update channel changed while waiting");
+                        return true;
+                    }
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref _attemptsAwaitingConsent);
+                    attempt.ClearAwaitingConsent();
+                }
+
+                LogUpdateInfo("Installing update — launching installer.");
+                await LaunchInstallerAsync(installerPath, installerHash, handoff, installingInBackground);
+                if (!installingInBackground)
+                    return true;
+
+                LogUpdateWarn("Auto-updater: the background installation did not replace UniGetUI — waiting for the user.");
+                AbstractOperation.HoldNewOperations = false;
+                installingInBackground = false;
+                canInstallInBackground = false;
+                _installRequested = false;
+                ReleaseLockForAutoupdate_Notification = false;
+                InstallerHandoffs.Complete(handoff);
+                handoff = InstallerHandoffs.Begin();
+            }
+        }
+        finally
+        {
+            if (installingInBackground)
+                AbstractOperation.HoldNewOperations = false;
+            InstallerHandoffs.Complete(handoff);
+        }
     }
 
-    private static async Task LaunchInstallerAsync(string installerLocation)
+    private static bool WasBackgroundInstallTried(string versionName)
+    {
+        lock (_backgroundInstallTriedVersions)
+            return _backgroundInstallTriedVersions.Contains(versionName);
+    }
+
+    private static void MarkBackgroundInstallTried(string versionName)
+    {
+        lock (_backgroundInstallTriedVersions)
+            _backgroundInstallTriedVersions.Add(versionName);
+    }
+
+    internal static bool BackgroundInstallNeedsElevation()
+        => OperatingSystem.IsWindows()
+            && AutoUpdaterInstallerArguments.DetectInstallScope(CoreData.UniGetUIExecutableDirectory) is not WindowsInstallScope.CurrentUser
+            && !CoreTools.IsAdministrator();
+
+    private static bool AnotherUniGetUIProcessIsRunning()
+    {
+        using Process current = Process.GetCurrentProcess();
+        foreach (string name in UniGetUIProcessNames)
+        {
+            Process[] processes = Process.GetProcessesByName(name);
+            try
+            {
+                if (processes.Any(p => p.Id != current.Id && p.SessionId == current.SessionId))
+                    return true;
+            }
+            finally
+            {
+                foreach (Process process in processes)
+                    process.Dispose();
+            }
+        }
+
+        return false;
+    }
+
+    private static IdleSelfUpdateSnapshot SampleIdleState(bool otherInstanceRunning)
+    {
+        MainWindow? window = MainWindow.Instance;
+        return new IdleSelfUpdateSnapshot(
+            IsEnabled: Settings.Get(Settings.K.InstallUniGetUIUpdatesWhenIdle)
+                && !Settings.Get(Settings.K.DisableAutoUpdateWingetUI),
+            IsBusy: otherInstanceRunning || QuitAfterAutomaticUpdates.IsBusy(),
+            IsWindowVisible: window is null || (window.IsVisible && window.WindowState != WindowState.Minimized),
+            HasUnsavedWork: window?.HasUnsavedWork ?? false,
+            IsQuitting: window?.IsQuitting ?? false);
+    }
+
+    private static async Task LaunchInstallerAsync(
+        string installerLocation,
+        string installerHash,
+        TaskCompletionSource handoff,
+        bool launchInBackground = false)
     {
         if (OperatingSystem.IsMacOS())
         {
-            await LaunchMacInstallerAsync(installerLocation);
+            await LaunchMacInstallerAsync(installerLocation, installerHash);
             return;
         }
 
@@ -669,13 +974,30 @@ internal static partial class AvaloniaAutoUpdater
             return;
         }
 
+        WindowsInstallScope installScope = AutoUpdaterInstallerArguments.DetectInstallScope(
+            CoreData.UniGetUIExecutableDirectory);
+
+        string installerArguments = AutoUpdaterInstallerArguments.ForWindows(
+            CoreData.IsPortable,
+            CoreData.UniGetUIExecutableDirectory,
+            installScope,
+            launchInBackground);
+
+        LogUpdateInfo(
+            $"Installation scope for {CoreData.UniGetUIExecutableDirectory} resolved as {installScope}.");
+
+        if (CoreData.IsPortable)
+        {
+            LogUpdateInfo($"Portable install: updating in place at {CoreData.UniGetUIExecutableDirectory}");
+        }
+
         LogUpdateInfo($"Launching installer: {installerLocation}");
         using Process p = new()
         {
             StartInfo = new ProcessStartInfo
             {
                 FileName = installerLocation,
-                Arguments = "/SILENT /SUPPRESSMSGBOXES /NORESTART /SP- /NoVCRedist /NoEdgeWebView /NoWinGet /NoRedirectionGuard /NoDesktopShortcut",
+                Arguments = installerArguments,
                 UseShellExecute = true,
                 CreateNoWindow = true,
             },
@@ -716,6 +1038,7 @@ internal static partial class AvaloniaAutoUpdater
         }
 
         LogUpdateInfo($"Installer process started (PID {p.Id}). The installer is expected to terminate UniGetUI before file replacement.");
+        InstallerHandoffs.Complete(handoff);
 
         RaiseStatus(
             CoreTools.Translate("UniGetUI is being updated..."),
@@ -764,9 +1087,15 @@ internal static partial class AvaloniaAutoUpdater
     }
 
     [SupportedOSPlatform("macos")]
-    private static async Task LaunchMacInstallerAsync(string installerLocation)
+    private static async Task LaunchMacInstallerAsync(string installerLocation, string installerHash)
     {
         LogUpdateInfo($"Applying macOS update from archive: {installerLocation}");
+
+        MacUpdateTarget updateTarget = ResolveMacUpdateTarget();
+        if (ReportMacUpdateTargetIfBlocked(updateTarget))
+        {
+            return;
+        }
 
         RaiseStatus(
             CoreTools.Translate("UniGetUI is being updated..."),
@@ -829,8 +1158,7 @@ internal static partial class AvaloniaAutoUpdater
             return;
         }
 
-        // Replace the *running* bundle wherever it lives, falling back to /Applications.
-        string target = ResolveRunningMacAppBundle() ?? "/Applications/UniGetUI.app";
+        string target = updateTarget.BundlePath;
 
         if (!Directory.Exists(target))
         {
@@ -853,6 +1181,12 @@ internal static partial class AvaloniaAutoUpdater
 
         LogUpdateInfo($"Replacing {target} with the freshly-extracted bundle and relaunching.");
 
+        if (updateTarget.Status == MacUpdateTargetStatus.NotWritable)
+        {
+            await ApplyMacUpdateAsAdminAsync(target, installerLocation, installerHash);
+            return;
+        }
+
         // The swap is handed to a detached helper that waits for THIS process to exit
         // before touching the bundle, so the running app never has its files yanked out
         // from under it. On success the helper relaunches the new bundle; on any failure
@@ -861,10 +1195,10 @@ internal static partial class AvaloniaAutoUpdater
         // relaunched copy confirms success via CheckForOrphanedUpdateAttempt() by
         // comparing its own version against the recorded target version.
         //
-        // Arguments are passed positionally ($1=pid, $2=target, $3=new app) so no path
-        // is ever interpolated into the script text.
+        // Arguments are passed positionally ($1=pid, $2=target, $3=new app, $4=update log,
+        // $5=failure marker, $6=redacted target) so no path is ever interpolated into the script text.
         const string swap = """
-            pid="$1"; target="$2"; newapp="$3"
+            pid="$1"; target="$2"; newapp="$3"; log="$4"; marker="$5"; shown="$6"
             i=0
             while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 150 ]; do sleep 0.2; i=$((i+1)); done
             rm -rf "$target.old"
@@ -875,11 +1209,21 @@ internal static partial class AvaloniaAutoUpdater
               else
                 rm -rf "$target"
                 mv "$target.old" "$target"
+                printf '\n%s %s\n' "$marker" "$shown" >> "$log"
               fi
+            else
+              printf '\n%s %s\n' "$marker" "$shown" >> "$log"
             fi
             /usr/bin/open -na "$target"
             """;
-        if (!TrySpawnSwapHelper(swap, Environment.ProcessId.ToString(CultureInfo.InvariantCulture), target, newApp))
+        if (!TrySpawnSwapHelper(
+                swap,
+                Environment.ProcessId.ToString(CultureInfo.InvariantCulture),
+                target,
+                newApp,
+                _updateLogPath,
+                MacUpdateTargetResolver.SwapFailedMarker,
+                Logger.Redact(target)))
         {
             // We could not even launch the helper, so nothing was changed. Report and bail
             // without exiting so the user keeps a working copy.
@@ -896,6 +1240,81 @@ internal static partial class AvaloniaAutoUpdater
 
         // Match the Windows flow: terminate the running copy so the helper can replace
         // the bundle and relaunch the freshly-installed version.
+        Environment.Exit(0);
+    }
+
+    // Swaps a bundle the user cannot write to through the macOS administrator prompt, while
+    // this process still runs, then relaunches the new bundle once it has exited.
+    [SupportedOSPlatform("macos")]
+    private static async Task ApplyMacUpdateAsAdminAsync(string target, string archive, string expectedHash)
+    {
+        string pid = Environment.ProcessId.ToString(CultureInfo.InvariantCulture);
+        string command = string.Join(
+            ' ',
+            "/bin/sh -c",
+            CoreTools.QuoteForPosixShell(MacUpdateTargetResolver.ElevatedSwapScript),
+            "sh",
+            CoreTools.QuoteForPosixShell(target),
+            CoreTools.QuoteForPosixShell(archive),
+            CoreTools.QuoteForPosixShell(expectedHash.ToLowerInvariant()),
+            pid);
+
+        bool swapped;
+        // Keeps a Quit from exiting on its handoff timeout while the user still has the prompt open.
+        using IDisposable prompt = InstallerHandoffs.BeginInteraction();
+        try
+        {
+            swapped = await MacAdminFileInstaller.RunAsync(
+                command,
+                CoreTools.Translate("UniGetUI needs administrator rights to install its update."));
+        }
+        catch (Exception ex)
+        {
+            LogUpdateError($"Could not replace {target} with administrator rights:");
+            LogUpdateError(ex);
+            RaiseStatus(
+                CoreTools.Translate("The update could not be applied."),
+                ex.Message,
+                InfoBarSeverity.Error,
+                isClosable: true,
+                actionButtonText: CoreTools.Translate("View log"),
+                actionButtonAction: OpenUpdateLog);
+            MarkAttemptFinished("administrator swap failed");
+            return;
+        }
+
+        if (!swapped)
+        {
+            LogUpdateWarn("The administrator prompt was cancelled; the update was not installed.");
+            RaiseStatus(
+                CoreTools.Translate("An update for UniGetUI is available, but installing it requires administrator rights."),
+                CoreTools.Translate("Your account cannot modify {0} without administrator rights.", target),
+                InfoBarSeverity.Warning,
+                isClosable: true,
+                actionButtonText: CoreTools.Translate("View log"),
+                actionButtonAction: OpenUpdateLog);
+            MarkAttemptFinished("administrator prompt cancelled");
+            return;
+        }
+
+        const string relaunch = """
+            pid="$1"; target="$2"
+            i=0
+            while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 150 ]; do sleep 0.2; i=$((i+1)); done
+            /usr/bin/open -na "$target"
+            """;
+        if (!TrySpawnSwapHelper(relaunch, pid, target))
+        {
+            // The new version is already in place; it only needs to be opened again.
+            RaiseStatus(
+                CoreTools.Translate("Update installed."),
+                CoreTools.Translate("Restart UniGetUI to start using the new version."),
+                InfoBarSeverity.Success,
+                isClosable: true);
+            MarkAttemptFinished("administrator swap succeeded; relaunch helper could not start");
+            return;
+        }
+
         Environment.Exit(0);
     }
 
@@ -1169,30 +1588,73 @@ internal static partial class AvaloniaAutoUpdater
         return stagingDir;
     }
 
-    // Walks up from the running executable to the enclosing ".app" bundle directory.
     [SupportedOSPlatform("macos")]
-    private static string? ResolveRunningMacAppBundle()
+    private static MacUpdateTarget ResolveMacUpdateTarget()
     {
-        // Environment.ProcessPath is typically /Applications/UniGetUI.app/Contents/MacOS/UniGetUI.
-        string? dir = Path.GetDirectoryName(Environment.ProcessPath);
-        while (!string.IsNullOrEmpty(dir))
+        MacUpdateTarget target = MacUpdateTargetResolver.Resolve(
+            Environment.ProcessPath,
+            MacBundleLocation.TryGetTranslocatedOriginalPath,
+            Directory.Exists,
+            MacBundleLocation.IsWritable,
+            MacBundleLocation.IsOnReadOnlyVolume);
+
+        if (target.RunningBundlePath is not null && MacUpdateTargetResolver.IsTranslocatedPath(target.RunningBundlePath))
         {
-            if (dir.EndsWith(".app", StringComparison.OrdinalIgnoreCase))
-            {
-                return dir;
-            }
-            dir = Path.GetDirectoryName(dir);
+            LogUpdateInfo(
+                $"UniGetUI is running from the translocated copy {target.RunningBundlePath}; "
+                + $"update target resolved to {target.BundlePath} ({target.Status}).");
         }
-        return null;
+
+        return target;
+    }
+
+    private static bool ReportMacUpdateTargetIfBlocked(MacUpdateTarget target)
+    {
+        switch (target.Status)
+        {
+            case MacUpdateTargetStatus.TranslocatedUnresolved:
+                LogUpdateWarn(
+                    $"UniGetUI is running from the temporary location {target.BundlePath} and its original location could not be resolved; the update will not be applied.");
+                RaiseStatus(
+                    CoreTools.Translate("UniGetUI cannot update itself from a temporary location."),
+                    CoreTools.Translate("macOS is running UniGetUI from a temporary copy that cannot be modified. Move UniGetUI to the Applications folder, open it from there, and try again."),
+                    InfoBarSeverity.Warning,
+                    isClosable: true,
+                    actionButtonText: CoreTools.Translate("View log"),
+                    actionButtonAction: OpenUpdateLog);
+                MarkAttemptFinished("running from a translocated location that could not be resolved");
+                return true;
+
+            case MacUpdateTargetStatus.ReadOnlyVolume:
+                LogUpdateWarn(
+                    $"UniGetUI is running from {target.BundlePath}, which is on a read-only volume; the update will not be downloaded.");
+                RaiseStatus(
+                    CoreTools.Translate("UniGetUI cannot update itself from a read-only location."),
+                    CoreTools.Translate("UniGetUI is running from {0}, which cannot be modified, for example a mounted disk image. Move UniGetUI to the Applications folder, open it from there, and try again.", target.BundlePath),
+                    InfoBarSeverity.Warning,
+                    isClosable: true,
+                    actionButtonText: CoreTools.Translate("View log"),
+                    actionButtonAction: OpenUpdateLog);
+                MarkAttemptFinished("update target is on a read-only volume");
+                return true;
+
+            case MacUpdateTargetStatus.NotWritable:
+                LogUpdateInfo(
+                    $"The current user cannot replace {target.BundlePath} (the bundle or its parent folder is not writable); administrator rights will be requested to install the update.");
+                return false;
+
+            default:
+                return false;
+        }
     }
 
     // ------------------------------------------------------------------ update check sources
-    private static async Task<UpdateCandidate> GetUpdateCandidateAsync(UpdaterOverrides overrides)
+    private static async Task<UpdateCandidate> GetUpdateCandidateAsync(UpdaterOverrides overrides, bool useBeta)
     {
-        return await CheckFromProductInfoAsync(overrides);
+        return await CheckFromProductInfoAsync(overrides, useBeta);
     }
 
-    private static async Task<UpdateCandidate> CheckFromProductInfoAsync(UpdaterOverrides overrides)
+    private static async Task<UpdateCandidate> CheckFromProductInfoAsync(UpdaterOverrides overrides, bool useBeta)
     {
         LogUpdateDebug($"Checking updates via ProductInfo: {overrides.ProductInfoUrl}");
 
@@ -1230,8 +1692,7 @@ internal static partial class AvaloniaAutoUpdater
             );
         }
 
-        bool useBeta = Settings.Get(Settings.K.EnableUniGetUIBeta);
-        ProductInfoChannel? channel = useBeta ? product.Beta : product.Current;
+        ProductInfoChannel? channel = SelectChannel(product, useBeta);
         if (channel is null)
         {
             throw new KeyNotFoundException(
@@ -1245,15 +1706,21 @@ internal static partial class AvaloniaAutoUpdater
             throw new InvalidOperationException($"Installer URL is not allowed: {installer.Url}");
         }
 
-        Version current = ParseVersionOrFallback(
+        Version currentFallback = new(0, 0, 0, CoreData.BuildNumber);
+        SemanticVersion current = AutoUpdaterHelpers.ParseUpdaterVersionOrFallback(
             CoreData.VersionName,
-            new Version(0, 0, 0, CoreData.BuildNumber)
+            currentFallback,
+            message => LogUpdateWarn(message)
         );
-        Version available = ParseVersionOrFallback(channel.Version, new Version(0, 0, 0, 0));
+        SemanticVersion available = AutoUpdaterHelpers.ParseUpdaterVersionOrFallback(
+            channel.Version,
+            new Version(0, 0, 0, 0),
+            message => LogUpdateWarn(message)
+        );
         bool upgradable = available > current;
 
         LogUpdateDebug(
-            $"ProductInfo check: current={current}, available={available}, upgradable={upgradable}"
+            $"ProductInfo check: current={current} (raw='{CoreData.VersionName}'), available={available} (raw='{channel.Version}'), beta={useBeta}, upgradable={upgradable}"
         );
 
         return new UpdateCandidate(upgradable, channel.Version, installer.Hash, installer.Url, "ProductInfo");
@@ -1557,32 +2024,35 @@ internal static partial class AvaloniaAutoUpdater
         && f.Arch.Equals(arch, StringComparison.OrdinalIgnoreCase)
         && f.Url.Contains(osToken, StringComparison.OrdinalIgnoreCase);
 
-    private static Version ParseVersionOrFallback(string raw, Version fallback)
+    private static ProductInfoChannel? SelectChannel(ProductInfoProduct product, bool useBeta)
     {
-        string sanitized = raw.Trim().TrimStart('v', 'V');
-        if (Version.TryParse(sanitized, out Version? parsed))
+        if (!useBeta)
         {
-            return CoreTools.NormalizeVersionForComparison(parsed);
+            return product.Current;
         }
 
-        LogUpdateWarn($"Could not parse version '{raw}', using fallback '{fallback}'");
-        return fallback;
-    }
-
-    // Normalize trailing zero components so "2026.1.11" and "2026.1.11.0" compare equal.
-    private static bool VersionsMatch(string a, string b)
-    {
-        string sa = a.Trim().TrimStart('v', 'V');
-        string sb = b.Trim().TrimStart('v', 'V');
-
-        if (Version.TryParse(sa, out Version? va) && Version.TryParse(sb, out Version? vb))
+        if (product.Beta is null)
         {
-            return CoreTools.NormalizeVersionForComparison(va)
-                .Equals(CoreTools.NormalizeVersionForComparison(vb));
+            return product.Current;
         }
 
-        return string.Equals(sa, sb, StringComparison.OrdinalIgnoreCase);
+        if (product.Current is null)
+        {
+            return product.Beta;
+        }
+
+        return AutoUpdaterHelpers.IsUpdateAvailable(product.Current.Version, product.Beta.Version)
+            ? product.Beta
+            : product.Current;
     }
+
+    internal static bool IsDefaultDevVersion(string? rawVersion) =>
+        AutoUpdaterHelpers.IsDefaultDevVersion(rawVersion);
+
+    // Normalize trailing zero components and prerelease labels so "2026.1.11" / "2026.1.11.0"
+    // and "2026.3.2-beta1" / "2026.3.2.0-beta1" compare equal.
+    internal static bool VersionsMatch(string a, string b) =>
+        AutoUpdaterHelpers.VersionsMatch(a, b);
 
     private static string NormalizeThumbprint(string thumbprint) =>
         new(thumbprint.ToLowerInvariant().Where(char.IsAsciiHexDigit).ToArray());

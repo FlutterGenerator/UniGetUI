@@ -20,12 +20,31 @@ namespace UniGetUI.PackageEngine.Classes.Manager
 
         public bool LastInstalledListingFailed => false;
 
+        public long InstalledPackagesGeneration => 0;
+
+        public void InvalidateInstalledPackages() { }
+
         public static NullPackageManager Instance = new();
         public ManagerProperties Properties { get; }
         public ManagerCapabilities Capabilities { get; }
         public ManagerStatus Status { get; }
         public Encoding OutputEncoding => Encoding.UTF8;
         public bool InstallerUrlFollowsPackageVersion => false;
+
+        public bool CommandLineIsShellInterpreted => false;
+
+        public bool IdentifiersAreQuotedOnCommandLine => false;
+
+        public int? CompareVersions(string versionA, string versionB)
+        {
+            var parsedA = CoreTools.VersionStringToStruct(versionA);
+            var parsedB = CoreTools.VersionStringToStruct(versionB);
+
+            if (parsedA == CoreTools.Version.Null || parsedB == CoreTools.Version.Null)
+                return null;
+
+            return parsedA.CompareTo(parsedB);
+        }
         public string Id
         {
             get => string.IsNullOrWhiteSpace(Properties.Id) ? Properties.Name : Properties.Id;
@@ -151,6 +170,12 @@ namespace UniGetUI.PackageEngine.Classes.Manager
 
     internal sealed class NullPkgOperationHelper : IPackageOperationHelper
     {
+        public IReadOnlyList<string> GetStandaloneParameters(
+            IPackage package,
+            InstallOptions options,
+            OperationType operation
+        ) => GetParameters(package, options, operation);
+
         public IReadOnlyList<string> GetParameters(
             IPackage package,
             InstallOptions options,
@@ -165,6 +190,12 @@ namespace UniGetUI.PackageEngine.Classes.Manager
         ) => throw new NotImplementedException();
 
         public void ApplyElevationRequirements(
+            IPackage package,
+            InstallOptions options,
+            OperationType operation
+        ) => throw new NotImplementedException();
+
+        public void ApplyOperationOverrides(
             IPackage package,
             InstallOptions options,
             OperationType operation

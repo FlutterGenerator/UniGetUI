@@ -5,6 +5,7 @@ using UniGetUI.Core.SettingsEngine.SecureSettings;
 using UniGetUI.Core.Tools;
 using UniGetUI.Interface.Enums;
 using UniGetUI.PackageEngine;
+using UniGetUI.PackageEngine.Classes.Manager.Classes;
 using UniGetUI.PackageEngine.Classes.Serializable;
 using UniGetUI.PackageEngine.Enums;
 using UniGetUI.PackageEngine.Interfaces;
@@ -72,6 +73,12 @@ public sealed class IpcBundleInstallRequest
 public sealed class IpcBundleSecurityEntry
 {
     public string PackageId { get; set; } = "";
+    public string ManagerName { get; set; } = "";
+    public string Source { get; set; } = "";
+    public string Severity { get; set; } = "";
+    public string Field { get; set; } = "";
+    public string Label { get; set; } = "";
+    public string Value { get; set; } = "";
     public string Line { get; set; } = "";
     public bool Allowed { get; set; }
 }
@@ -610,81 +617,32 @@ public static class IpcBundleApi
         );
 
         var report = new BundleReport { IsEmpty = true };
-        bool allowCliArguments =
-            SecureSettings.Get(SecureSettings.K.AllowCLIArguments)
-            && SecureSettings.Get(SecureSettings.K.AllowImportingCLIArguments);
-        bool allowPrePostCommands =
-            SecureSettings.Get(SecureSettings.K.AllowPrePostOpCommand)
-            && SecureSettings.Get(SecureSettings.K.AllowImportPrePostOpCommands);
+        bool allowCliArguments = BundleImportFilter.CliArgumentsAllowed();
+        bool allowPrePostCommands = BundleImportFilter.PrePostCommandsAllowed();
 
         List<IPackage> packages = [];
         foreach (var package in deserializedData.packages)
         {
-            var options = package.InstallationOptions;
-            ReportList(
-                ref report,
-                package.Id,
-                options.CustomParameters_Install,
-                "Custom install arguments",
-                allowCliArguments
+            var manager = IpcManagerSettingsApi.ResolveImportedManager(package.ManagerName);
+            var (sourceName, sourceStatus) = BundleImportFilter.ClassifySource(
+                manager,
+                package.Source
             );
-            ReportList(
+            package.InstallationOptions = BundleImportFilter.Apply(
                 ref report,
-                package.Id,
-                options.CustomParameters_Update,
-                "Custom update arguments",
-                allowCliArguments
+                new BundleReportSubject(
+                    package.Id,
+                    package.Name,
+                    manager?.DisplayName ?? package.ManagerName,
+                    sourceName
+                ),
+                package.InstallationOptions,
+                allowCliArguments,
+                allowPrePostCommands,
+                manager?.CommandLineIsShellInterpreted ?? false,
+                sourceName,
+                sourceStatus
             );
-            ReportList(
-                ref report,
-                package.Id,
-                options.CustomParameters_Uninstall,
-                "Custom uninstall arguments",
-                allowCliArguments
-            );
-            options.PreInstallCommand = ReportString(
-                ref report,
-                package.Id,
-                options.PreInstallCommand,
-                "Pre-install command",
-                allowPrePostCommands
-            );
-            options.PostInstallCommand = ReportString(
-                ref report,
-                package.Id,
-                options.PostInstallCommand,
-                "Post-install command",
-                allowPrePostCommands
-            );
-            options.PreUpdateCommand = ReportString(
-                ref report,
-                package.Id,
-                options.PreUpdateCommand,
-                "Pre-update command",
-                allowPrePostCommands
-            );
-            options.PostUpdateCommand = ReportString(
-                ref report,
-                package.Id,
-                options.PostUpdateCommand,
-                "Post-update command",
-                allowPrePostCommands
-            );
-            options.PreUninstallCommand = ReportString(
-                ref report,
-                package.Id,
-                options.PreUninstallCommand,
-                "Pre-uninstall command",
-                allowPrePostCommands
-            );
-            options.PostUninstallCommand = ReportString(
-                ref report,
-                package.Id,
-                options.PostUninstallCommand,
-                "Post-uninstall command",
-                allowPrePostCommands
-            );
-            package.InstallationOptions = options;
             packages.Add(DeserializePackage(package));
         }
 
@@ -692,6 +650,8 @@ public static class IpcBundleApi
         {
             packages.Add(new InvalidImportedPackage(incompatiblePackage, NullSource.Instance));
         }
+
+        BundleImportFilter.LogReport(report, "IPC bundle import");
 
         await GetLoader().AddPackagesAsync(packages);
         return (deserializedData.export_version, report);
@@ -724,59 +684,6 @@ public static class IpcBundleApi
         return new ImportedPackage(raw, manager, source);
     }
 
-    private static void ReportList(
-        ref BundleReport report,
-        string packageId,
-        List<string> values,
-        string label,
-        bool allowed
-    )
-    {
-        if (!values.Any(value => value.Any()))
-        {
-            return;
-        }
-
-        if (!report.Contents.TryGetValue(packageId, out List<BundleReportEntry>? packageEntries))
-        {
-            packageEntries = [];
-            report.Contents[packageId] = packageEntries;
-        }
-
-        packageEntries.Add(
-            new BundleReportEntry($"{label}: [{string.Join(", ", values)}]", allowed)
-        );
-        report.IsEmpty = false;
-        if (!allowed)
-        {
-            values.Clear();
-        }
-    }
-
-    private static string ReportString(
-        ref BundleReport report,
-        string packageId,
-        string value,
-        string label,
-        bool allowed
-    )
-    {
-        if (!value.Any())
-        {
-            return value;
-        }
-
-        if (!report.Contents.TryGetValue(packageId, out List<BundleReportEntry>? packageEntries))
-        {
-            packageEntries = [];
-            report.Contents[packageId] = packageEntries;
-        }
-
-        packageEntries.Add(new BundleReportEntry($"{label}: {value}", allowed));
-        report.IsEmpty = false;
-        return allowed ? value : "";
-    }
-
     private static IReadOnlyList<IpcBundleSecurityEntry> FlattenReport(BundleReport report)
     {
         if (report.IsEmpty)
@@ -786,15 +693,26 @@ public static class IpcBundleApi
 
         return report
             .Contents.SelectMany(pair =>
-                pair.Value.Select(entry => new IpcBundleSecurityEntry
-                {
-                    PackageId = pair.Key,
-                    Line = entry.Line,
-                    Allowed = entry.Allowed,
-                })
+                pair.Value.Entries.Select(entry =>
+                    (PackageId: pair.Value.Subject, Entry: entry)
+                )
             )
-            .OrderBy(entry => entry.PackageId, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(entry => entry.Line, StringComparer.OrdinalIgnoreCase)
+            .OrderBy(item => item.PackageId.Id, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(item => item.PackageId.ManagerName, StringComparer.OrdinalIgnoreCase)
+            .ThenByDescending(item => item.Entry.Severity)
+            .ThenBy(item => item.Entry.Line, StringComparer.OrdinalIgnoreCase)
+            .Select(item => new IpcBundleSecurityEntry
+            {
+                PackageId = item.PackageId.Id,
+                ManagerName = item.PackageId.ManagerName,
+                Source = item.PackageId.Source,
+                Severity = item.Entry.Severity.ToString().ToLowerInvariant(),
+                Field = item.Entry.Field,
+                Label = item.Entry.Label,
+                Value = item.Entry.Value,
+                Line = item.Entry.Line,
+                Allowed = item.Entry.Allowed,
+            })
             .ToArray();
     }
 }

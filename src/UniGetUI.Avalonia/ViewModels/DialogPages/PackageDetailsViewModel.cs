@@ -6,10 +6,12 @@ using Avalonia.Platform;
 using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+using UniGetUI.Avalonia.Infrastructure;
 using UniGetUI.Core.Logging;
 using UniGetUI.Core.Tools;
 using UniGetUI.PackageEngine.Enums;
 using UniGetUI.PackageEngine.Interfaces;
+using UniGetUI.PackageEngine.PackageClasses;
 
 namespace UniGetUI.Avalonia.ViewModels;
 
@@ -22,6 +24,7 @@ public partial class PackageDetailsViewModel : ObservableObject
 
     public readonly IPackage Package;
     public readonly OperationType OperationRole;
+    private readonly CancellationTokenSource _loadingCancellation = new();
 
     // ── Header ─────────────────────────────────────────────────────────────────
     public string PackageName { get; }
@@ -52,6 +55,9 @@ public partial class PackageDetailsViewModel : ObservableObject
     // ── Basic info (raw values exposed; the view builds the inline rich text) ──
     [ObservableProperty]
     private string _versionDisplay = "";
+
+    [ObservableProperty]
+    private string? _installedVersionTooltip;
 
     [ObservableProperty]
     private Uri? _homepageUrl;
@@ -189,9 +195,13 @@ public partial class PackageDetailsViewModel : ObservableObject
             MainActionLabel = CoreTools.Translate(
                 "Update to version {0}", upgradable?.NewVersionString ?? package.NewVersionString);
             LabelVersion = CoreTools.Translate("Installed Version");
-            VersionDisplay = (upgradable?.VersionString ?? package.VersionString)
+            var updateSource = upgradable ?? package;
+            VersionDisplay = updateSource.VersionString
                              + " ➤ "
                              + (upgradable?.NewVersionString ?? package.NewVersionString);
+            InstalledVersionTooltip = InstalledVersionNotice.BuildTooltip(
+                updateSource
+            );
             AsAdminLabel = CoreTools.Translate("Update as administrator");
             InteractiveLabel = CoreTools.Translate("Interactive update");
             SkipHashOrRemoveDataLabel = CoreTools.Translate("Skip hash check");
@@ -201,7 +211,11 @@ public partial class PackageDetailsViewModel : ObservableObject
         {
             MainActionLabel = CoreTools.Translate("Uninstall");
             LabelVersion = CoreTools.Translate("Installed Version");
-            VersionDisplay = installed?.VersionString ?? package.VersionString;
+            var uninstallSource = installed ?? package;
+            VersionDisplay = uninstallSource.VersionString;
+            InstalledVersionTooltip = InstalledVersionNotice.BuildTooltip(
+                uninstallSource
+            );
             AsAdminLabel = CoreTools.Translate("Uninstall as administrator");
             InteractiveLabel = CoreTools.Translate("Interactive uninstall");
             SkipHashOrRemoveDataLabel = CoreTools.Translate("Uninstall and remove data");
@@ -228,6 +242,11 @@ public partial class PackageDetailsViewModel : ObservableObject
         _ = LoadIconAsync();
         _ = LoadScreenshotsAsync();
 
+        await RefreshDetailsAsync();
+    }
+
+    public async Task RefreshDetailsAsync()
+    {
         var details = Package.Details;
         if (!details.IsPopulated)
             await details.Load();
@@ -294,7 +313,7 @@ public partial class PackageDetailsViewModel : ObservableObject
                 Bitmap? bitmap = null;
                 if (uri.IsFile)
                 {
-                    bitmap = await Task.Run(() => new Bitmap(uri.LocalPath));
+                    bitmap = await Task.Run(() => BitmapLoader.LoadFile(uri.LocalPath));
                 }
                 else if (uri.Scheme is "http" or "https")
                 {
@@ -325,19 +344,23 @@ public partial class PackageDetailsViewModel : ObservableObject
         catch { }
     }
 
+    public void CancelLoading() => _loadingCancellation.Cancel();
+
     private async Task LoadScreenshotsAsync()
     {
+        var token = _loadingCancellation.Token;
         try
         {
-            var uris = await Task.Run(Package.GetScreenshots);
+            var uris = await Task.Run(Package.GetScreenshots, token);
             if (!uris.Any()) return;
 
             using var http = new HttpClient(CoreTools.GenericHttpClientParameters);
             foreach (var uri in uris)
             {
+                if (token.IsCancellationRequested) return;
                 try
                 {
-                    var bytes = await http.GetByteArrayAsync(uri);
+                    var bytes = await http.GetByteArrayAsync(uri, token);
                     using var ms = new MemoryStream(bytes);
                     var bmp = new Bitmap(ms);
                     await Dispatcher.UIThread.InvokeAsync(() =>
@@ -348,6 +371,9 @@ public partial class PackageDetailsViewModel : ObservableObject
                 }
                 catch { /* skip failed screenshots */ }
             }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
         }
         catch (Exception ex)
         {

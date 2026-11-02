@@ -17,6 +17,8 @@ namespace UniGetUI.PackageEngine.Managers.NpmManager
 {
     public class Npm : PackageManager
     {
+        public override bool CommandLineIsShellInterpreted => true;
+
         public Npm()
         {
             Capabilities = new ManagerCapabilities
@@ -55,26 +57,32 @@ namespace UniGetUI.PackageEngine.Managers.NpmManager
 
         protected override IReadOnlyList<Package> FindPackages_UnSafe(string query)
         {
-            using Process p = new()
+            var startInfo = new ProcessStartInfo
             {
-                StartInfo = new ProcessStartInfo
-                {
-                    FileName = Status.ExecutablePath,
-                    Arguments = Status.ExecutableCallArgs + " search \"" + query + "\" --json",
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    RedirectStandardInput = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    WorkingDirectory = Environment.GetFolderPath(
-                        Environment.SpecialFolder.UserProfile
-                    ),
-                    StandardOutputEncoding = System.Text.Encoding.UTF8,
-                },
+                FileName = Status.ExecutablePath,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                RedirectStandardInput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WorkingDirectory = Environment.GetFolderPath(
+                    Environment.SpecialFolder.UserProfile
+                ),
+                StandardOutputEncoding = System.Text.Encoding.UTF8,
             };
 
+            if (
+                Status.OperationCallArgs.Count is 0
+                && !string.IsNullOrWhiteSpace(Status.ExecutableCallArgs)
+            )
+                startInfo.Arguments = BuildSearchArguments(query);
+            else
+                Status.ApplyArguments(startInfo, "search", query, "--json");
+
+            using Process p = new() { StartInfo = startInfo };
+
             IProcessTaskLogger logger = TaskLogger.CreateNew(LoggableTaskType.FindPackages, p);
-            p.Start();
+            CoreTools.StartAndCloseStandardInput(p);
 
             string strContents = p.StandardOutput.ReadToEnd();
             logger.AddToStdOut(strContents);
@@ -118,7 +126,7 @@ namespace UniGetUI.PackageEngine.Managers.NpmManager
                 };
 
                 IProcessTaskLogger logger = TaskLogger.CreateNew(LoggableTaskType.ListUpdates, p);
-                p.Start();
+                CoreTools.StartAndCloseStandardInput(p);
 
                 string strContents = p.StandardOutput.ReadToEnd();
                 logger.AddToStdOut(strContents);
@@ -167,7 +175,7 @@ namespace UniGetUI.PackageEngine.Managers.NpmManager
                     LoggableTaskType.ListInstalledPackages,
                     p
                 );
-                p.Start();
+                CoreTools.StartAndCloseStandardInput(p);
 
                 string strContents = p.StandardOutput.ReadToEnd();
                 logger.AddToStdOut(strContents);
@@ -181,8 +189,178 @@ namespace UniGetUI.PackageEngine.Managers.NpmManager
             return Packages;
         }
 
-        public override IReadOnlyList<string> FindCandidateExecutableFiles() =>
-            CoreTools.WhichMultiple(OperatingSystem.IsWindows() ? "npm.cmd" : "npm");
+        /// <summary>
+        /// When npm is reached through its own npm.ps1 the query travels as a separate argument, so
+        /// nothing has to be escaped. The remaining case is a Windows install without npm.ps1, where
+        /// the call still goes through powershell -Command and the query has to be quoted.
+        /// </summary>
+        private string BuildSearchArguments(string query) =>
+            Status.ExecutableCallArgs
+            + " search "
+            + CoreTools.EscapePowerShellSingleQuoted(query)
+            + " --json";
+
+        public override IReadOnlyList<string> FindCandidateExecutableFiles()
+        {
+            if (OperatingSystem.IsWindows())
+                return CoreTools.WhichMultiple("npm.cmd");
+
+            return CoreTools.WhichMultiple("npm")
+                .Concat(
+                    GetNvmBinDirectories(
+                            Environment.GetEnvironmentVariable,
+                            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
+                        )
+                        .Select(directory => Path.Join(directory, "npm"))
+                        .Where(IsExecutableFile)
+                )
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+        }
+
+        internal static IReadOnlyList<string> GetNvmBinDirectories(
+            Func<string, string?> readEnvironmentVariable,
+            string userProfileDirectory
+        )
+        {
+            string nvmDirectory;
+            if (readEnvironmentVariable("NVM_DIR")?.Trim() is { Length: > 0 } configured)
+                nvmDirectory = configured;
+            else if (userProfileDirectory.Trim() is { Length: > 0 } userProfile)
+                nvmDirectory = Path.Join(userProfile, ".nvm");
+            else
+                return [];
+
+            List<(Version Version, string Directory)> installed = [];
+            try
+            {
+                string versionsDirectory = Path.Join(nvmDirectory, "versions", "node");
+                if (!Directory.Exists(versionsDirectory))
+                    return [];
+
+                foreach (string directory in Directory.EnumerateDirectories(versionsDirectory))
+                {
+                    string name = Path.GetFileName(directory);
+                    if (name.StartsWith('v') && Version.TryParse(name[1..], out Version? version))
+                        installed.Add((version, directory));
+                }
+            }
+            catch (IOException)
+            {
+                return [];
+            }
+            catch (UnauthorizedAccessException)
+            {
+                return [];
+            }
+
+            installed.Sort((a, b) => b.Version.CompareTo(a.Version));
+
+            if (ResolveNvmAlias(nvmDirectory, "default") is { } defaultVersion)
+            {
+                int index = installed.FindIndex(entry => MatchesNvmVersion(entry.Version, defaultVersion));
+                if (index > 0)
+                {
+                    var entry = installed[index];
+                    installed.RemoveAt(index);
+                    installed.Insert(0, entry);
+                }
+            }
+
+            return installed.Select(entry => Path.Join(entry.Directory, "bin")).ToArray();
+        }
+
+        private static string? ResolveNvmAlias(string nvmDirectory, string alias)
+        {
+            for (int hop = 0; hop < 8; hop++)
+            {
+                string value;
+                try
+                {
+                    string aliasFile = Path.Join(nvmDirectory, "alias", alias);
+                    if (!File.Exists(aliasFile))
+                        return null;
+                    value = File.ReadAllText(aliasFile).Trim();
+                }
+                catch (IOException)
+                {
+                    return null;
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    return null;
+                }
+
+                if (value.Length is 0 || value is "node" or "stable")
+                    return null;
+                if (IsNvmVersionSpecification(value))
+                    return value;
+                alias = value;
+            }
+
+            return null;
+        }
+
+        private static bool IsNvmVersionSpecification(string value)
+        {
+            string[] parts = (value.StartsWith('v') ? value[1..] : value).Split('.');
+            return parts.Length is >= 1 and <= 3
+                && parts.All(part => part.Length > 0 && part.All(char.IsAsciiDigit));
+        }
+
+        private static bool MatchesNvmVersion(Version version, string specification)
+        {
+            string[] parts = specification.TrimStart('v').Split('.');
+            int[] components = [version.Major, version.Minor, version.Build];
+            if (parts.Length > components.Length)
+                return false;
+
+            for (int i = 0; i < parts.Length; i++)
+            {
+                if (!int.TryParse(parts[i], out int value) || value != components[i])
+                    return false;
+            }
+
+            return true;
+        }
+
+        private static bool IsExecutableFile(string path)
+        {
+            if (!File.Exists(path))
+                return false;
+
+            if (OperatingSystem.IsWindows())
+                return true;
+
+            const UnixFileMode ExecutableBits =
+                UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute;
+
+            try
+            {
+                return (File.GetUnixFileMode(path) & ExecutableBits) is not 0;
+            }
+            catch (IOException)
+            {
+                return false;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                return false;
+            }
+        }
+
+        internal static string AppendDirectoryToPath(string? currentPath, string directory)
+        {
+            if (string.IsNullOrEmpty(currentPath))
+                return directory;
+
+            string trimmedDirectory = Path.TrimEndingDirectorySeparator(directory);
+            bool alreadyPresent = currentPath
+                .Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
+                .Any(entry => Path.TrimEndingDirectorySeparator(entry) == trimmedDirectory);
+
+            return alreadyPresent ? currentPath : currentPath + Path.PathSeparator + directory;
+        }
 
         protected override void _loadManagerExecutableFile(
             out bool found,
@@ -202,8 +380,74 @@ namespace UniGetUI.PackageEngine.Managers.NpmManager
                 return;
             }
 
+            if (found && Path.GetDirectoryName(_executable) is { Length: > 0 } executableDirectory)
+            {
+                string? currentPath = Environment.GetEnvironmentVariable("PATH");
+                string updatedPath = AppendDirectoryToPath(currentPath, executableDirectory);
+                if (updatedPath != currentPath)
+                {
+                    Environment.SetEnvironmentVariable("PATH", updatedPath);
+                    Logger.Info($"Added {executableDirectory} to the PATH so npm can reach its node");
+                }
+            }
+
             path = _executable;
             callArguments = "";
+        }
+
+        protected override IReadOnlyList<string> _getOperationCallArgs(
+            string executablePath,
+            string callArguments
+        )
+        {
+            if (!OperatingSystem.IsWindows())
+                return [];
+
+            var (found, executable) = GetExecutableFile();
+            if (!found)
+                return [];
+
+            string? script = ResolvePowerShellEntryPoint(executable);
+            if (script is null)
+                return [];
+
+            // Finding npm.ps1 does not prove this shell may run it, and npm.cmd still works, so
+            // the capability is confirmed before giving up the working fallback.
+            if (!CoreTools.PowerShellLauncherWorks(executablePath, CoreData.PowerShellOperationLauncher))
+            {
+                Logger.Warn("Not using -File for npm operations; falling back to -Command");
+                return [];
+            }
+
+            return ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script];
+        }
+
+        /// <summary>
+        /// npm ships an npm.ps1 next to the npm.cmd shim. Running that script with -File keeps the
+        /// operation parameters as argv instead of handing them to a shell to re-parse.
+        /// </summary>
+        internal static string? ResolvePowerShellEntryPoint(string executable)
+        {
+            string? directory = Path.GetDirectoryName(executable);
+            if (string.IsNullOrEmpty(directory))
+                return null;
+
+            string candidate = Path.Join(
+                directory,
+                Path.GetFileNameWithoutExtension(executable) + ".ps1"
+            );
+            return File.Exists(candidate) ? candidate : null;
+        }
+
+        public override int? CompareVersions(string versionA, string versionB)
+        {
+            if (
+                SemanticVersion.TryParse(versionA, out SemanticVersion parsedA)
+                && SemanticVersion.TryParse(versionB, out SemanticVersion parsedB)
+            )
+                return parsedA.CompareTo(parsedB);
+
+            return base.CompareVersions(versionA, versionB);
         }
 
         protected override void _loadManagerVersion(out string version)
@@ -225,7 +469,7 @@ namespace UniGetUI.PackageEngine.Managers.NpmManager
                     StandardOutputEncoding = System.Text.Encoding.UTF8,
                 },
             };
-            process.Start();
+            CoreTools.StartAndCloseStandardInput(process);
             version = process.StandardOutput.ReadToEnd().Trim();
             process.WaitForExit();
         }

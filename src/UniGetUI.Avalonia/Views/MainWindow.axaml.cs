@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
 using Avalonia;
+using Avalonia.Automation;
 using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Interactivity;
@@ -16,10 +17,10 @@ using Avalonia.VisualTree;
 using UniGetUI.Avalonia.Extensions;
 using UniGetUI.Avalonia.Infrastructure;
 using UniGetUI.Avalonia.ViewModels;
+using UniGetUI.Avalonia.ViewModels.Pages;
 using UniGetUI.Avalonia.Views.Controls;
 using UniGetUI.Avalonia.Views.DialogPages;
 using UniGetUI.Avalonia.Views.Pages;
-using UniGetUI.Core.Data;
 using UniGetUI.Core.Logging;
 using UniGetUI.Core.SettingsEngine;
 using UniGetUI.Core.Tools;
@@ -43,6 +44,9 @@ public enum PageType
     About,
     Quit,
     Null, // Used for initializers
+    Catalog,
+    CatalogEditor,
+    GitRepositories,
 }
 
 public partial class MainWindow : Window
@@ -54,6 +58,18 @@ public partial class MainWindow : Window
     // AXAML size would overflow past the top of the window (see SetupTitleBar).
     private const double MAC_TITLE_BAR_CONTROL_SIZE = 24;
 
+    // Gap between the window edge and the floating glass sidebar panel on macOS.
+    private const double MAC_GLASS_INSET = 8;
+
+    // Trailing title-bar search field on macOS: its full width, and how far it may shrink.
+    private const double MAC_SEARCH_MAX_WIDTH = 358;
+    private const double MAC_SEARCH_MIN_WIDTH = 140;
+    private const double MAC_SEARCH_TRAILING_INSET = 12;
+
+    // Round close button on the leading edge of macOS sheets (in-window dialogs).
+    private const double MAC_SHEET_CLOSE_SIZE = 28;
+    private const double MAC_SHEET_CLOSE_INSET = 14;
+
     // Centre line of the macOS traffic lights, measured from the top of the window: they sit centred in
     // the native 28 px NSTitlebarContainerView. This can't be read back from WindowDecorationMargin,
     // because ExtendClientAreaTitleBarHeightHint makes that report our requested 44 px instead.
@@ -63,6 +79,15 @@ public partial class MainWindow : Window
     // the row's first glyph starts 4 px past this inset (the button's padding), so this leaves a ~21 px
     // gap — enough for the row to read as separate from the window buttons rather than crowding them.
     private const double MAC_TRAFFIC_LIGHT_INSET = 76;
+
+    // Space between the glass sidebar panel's edge and the close (red) button.
+    private const double MAC_TRAFFIC_LIGHT_PANEL_PADDING = 12;
+
+    // Space between the zoom (green) button and the first title-bar control, when its frame can be read.
+    private const double MAC_TRAFFIC_LIGHT_GAP = 14;
+
+    // Last zoom button frame read on macOS; logged when it changes, to diagnose title-bar alignment.
+    private Rect? _lastMacZoomButtonFrame;
 
     // Last known macOS title-bar height; seeded with the requested height for the window's first layout
     // pass and while fullscreen reports a collapsed decoration margin.
@@ -97,8 +122,17 @@ public partial class MainWindow : Window
     private const uint WM_DWMCOLORIZATIONCOLORCHANGED = 0x0320;
     private const nint SC_MAXIMIZE = 0xF030;
     private const nint SC_RESTORE = 0xF120;
+    private const int HTNOWHERE = 0;
     private const int HTCLIENT = 1;
     private const int HTMAXBUTTON = 9;
+    private const int HTLEFT = 10;
+    private const int HTRIGHT = 11;
+    private const int HTTOP = 12;
+    private const int HTTOPLEFT = 13;
+    private const int HTTOPRIGHT = 14;
+    private const int HTBOTTOM = 15;
+    private const int HTBOTTOMLEFT = 16;
+    private const int HTBOTTOMRIGHT = 17;
     private const uint TME_LEAVE = 0x0002;
     private const uint TME_NONCLIENT = 0x0010;
     private const int GWL_STYLE = -16;
@@ -127,11 +161,16 @@ public partial class MainWindow : Window
     private bool _maxButtonPressed;
     private TrayService? _trayService;
     private bool _allowClose;
-    private int _isQuitting;
+    private bool _showingHiddenTrayIconNotice;
+    private readonly ApplicationShutdownCoordinator _shutdownCoordinator = new();
 
     // Saved outer size (DIPs) awaiting a native, exact restore in OnOpened on Windows.
     private double _pendingRestoreWidth;
     private double _pendingRestoreHeight;
+    private const double DefaultWindowWidth = 1450;
+    private const double DefaultWindowHeight = 900;
+    private WindowPlacementResult? _unsavedPlacement;
+    private bool _hasOpened;
 
     // Last user-chosen height (px) of the operations panel; restored when re-expanded.
     private double _operationsPanelHeight = 240;
@@ -140,9 +179,11 @@ public partial class MainWindow : Window
     private readonly SemaphoreSlim _modalTransitionSemaphore = new(1, 1);
     private readonly List<ImmersiveDialog> _modalStack = new();
     private readonly Dictionary<ImmersiveDialog, Control?> _modalFocusHistory = new();
+    private readonly Dictionary<ImmersiveDialog, (double MinWidth, double MinHeight)> _modalMinimumSizeHistory = new();
     private readonly List<UniGetUiWebView> _webViewsHiddenForModal = new();
     private IDisposable? _modalTitleSubscription;
     private Control? _focusBeforeModal;
+    private bool _modalBackdropPressed;
 
     public enum RuntimeNotificationLevel
     {
@@ -160,19 +201,37 @@ public partial class MainWindow : Window
 
     private MainWindowViewModel ViewModel => (MainWindowViewModel)DataContext!;
     public PageType CurrentPage => ViewModel.CurrentPage_t;
+    public bool SoftwareCatalogEnabled => ViewModel.Sidebar.SoftwareCatalogEnabled;
+    public bool CatalogEditorEnabled => ViewModel.Sidebar.CatalogEditorEnabled;
+    public bool GitRepositoriesEnabled => ViewModel.Sidebar.GitRepositoriesEnabled;
+    public GitRepositoriesViewModel? GitRepositories => ViewModel.GitRepositories;
+    public void SetGitRepositoriesEnabled(bool enabled) => ViewModel.SetGitRepositoriesEnabled(enabled);
 
     public MainWindow()
     {
+        UiAutomationGuard.Attach(this);
         Instance = this;
         DataContext = new MainWindowViewModel();
         InitializeComponent();
+        if (OperatingSystem.IsWindows())
+        {
+            // WinUI's caption button uses ChromeRestore (U+E923). Windows 11 supplies it
+            // through Segoe Fluent Icons; Windows 10 exposes the same symbol in MDL2 Assets.
+            RestoreIcon.FontFamily = new FontFamily(
+                OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000)
+                    ? "Segoe Fluent Icons"
+                    : "Segoe MDL2 Assets");
+        }
         SetupTitleBar();
         SetupTitleBarFocusOpacity();
+        PlatformShortcuts.AdaptAcceleratorKeys(this);
+        SetupMacMenuBar();
         SetupResponsiveRail();
 
         RestoreGeometry();
 
         KeyDown += Window_KeyDown;
+        AddHandler(KeyDownEvent, Window_KeyDownTunnel, RoutingStrategies.Tunnel);
         ViewModel.CurrentPageChanged += OnCurrentPageChanged;
         // Title-bar back button: visible whenever there's somewhere to go back to (mirrors WinUI's TitleBar.IsBackButtonVisible).
         ViewModel.CanGoBackChanged += (_, canGoBack) => BackButton.IsVisible = canGoBack;
@@ -190,17 +249,12 @@ public partial class MainWindow : Window
 
         _trayService = new TrayService(this);
         _trayService.UpdateStatus();
-
-        // Let the elevation code activate us right before a UAC prompt, so we own the foreground
-        // and can delegate it to the consent UI (#5146). Only activate when we're already on screen;
-        // don't yank a tray-hidden window forward during silent/background elevation.
-        CoreData.BringMainWindowToForegroundAsync = () =>
-            Dispatcher.UIThread.InvokeAsync(() => { if (IsVisible) ShowFromTray(); }).GetTask();
     }
 
     protected override void OnOpened(EventArgs e)
     {
         base.OnOpened(e);
+        _hasOpened = true;
         if (!OperatingSystem.IsWindows())
             return;
 
@@ -251,9 +305,32 @@ public partial class MainWindow : Window
 
     protected override void OnClosing(WindowClosingEventArgs e)
     {
+        // The lifetime only closes the window for a session end that App let through, and cancelling
+        // here would still make Avalonia abort the logout.
+        if (e.CloseReason == WindowCloseReason.OSShutdown)
+        {
+            _allowClose = true;
+            ReleaseWindowResources();
+            base.OnClosing(e);
+            return;
+        }
+
         if (!_allowClose && (OperatingSystem.IsMacOS() || !Settings.Get(Settings.K.DisableSystemTray)))
         {
             e.Cancel = true;
+            if (_showingHiddenTrayIconNotice)
+                return;
+
+            // Without a tray icon nothing on screen shows that UniGetUI is still running, so say it once.
+            // macOS keeps the app in the Dock, which already makes that visible.
+            if (!OperatingSystem.IsMacOS()
+                && !Settings.IsSystemTrayIconVisible()
+                && !Settings.Get(Settings.K.ShownHiddenTrayIconNotice))
+            {
+                _ = ShowHiddenTrayIconNoticeThenHideAsync();
+                return;
+            }
+
             ViewModel.ClearAllSearchQueries();
             Hide();
             return;
@@ -263,12 +340,64 @@ public partial class MainWindow : Window
         QuitApplication();
     }
 
+    private async Task ShowHiddenTrayIconNoticeThenHideAsync()
+    {
+        _showingHiddenTrayIconNotice = true;
+        try
+        {
+            Settings.Set(Settings.K.ShownHiddenTrayIconNotice, true);
+            var dialog = new ImmersiveConfirmationDialog(
+                CoreTools.Translate("UniGetUI is still running"),
+                new TextBlock
+                {
+                    Text = CoreTools.Translate("UniGetUI keeps running in the background and checking for updates, without a system tray icon. To reopen it, launch UniGetUI again. To exit, use More > Quit UniGetUI in the navigation menu. You can change this in Settings > User interface preferences."),
+                    FontSize = 14,
+                    LineHeight = 20,
+                    TextWrapping = TextWrapping.Wrap,
+                },
+                CoreTools.Translate("OK"),
+                CoreTools.Translate("Quit UniGetUI"));
+            await dialog.ShowDialog(this);
+
+            if (dialog.Result is false)
+            {
+                QuitApplication();
+                return;
+            }
+
+            ViewModel.ClearAllSearchQueries();
+            Hide();
+        }
+        catch (Exception ex)
+        {
+            Logger.Error("Could not show the background notice:");
+            Logger.Error(ex);
+            Hide();
+        }
+        finally
+        {
+            _showingHiddenTrayIconNotice = false;
+        }
+    }
+
     private void ReleaseWindowResources()
     {
         SaveGeometryNow();
         AvaloniaAutoUpdater.ReleaseLockForAutoupdate_Window = true;
         _trayService?.Dispose();
         _trayService = null;
+    }
+
+    private void Window_KeyDownTunnel(object? sender, KeyEventArgs e)
+    {
+        if (e.Key is not Key.Tab || !e.KeyModifiers.HasFlag(KeyModifiers.Control) || ModalLayer.IsVisible)
+            return;
+
+        _focusSidebarSelectionOnNextPageChange = true;
+        ViewModel.NavigateTo(e.KeyModifiers.HasFlag(KeyModifiers.Shift)
+            ? MainWindowViewModel.GetPreviousPage(ViewModel.CurrentPage_t, ViewModel.ShortcutPages)
+            : MainWindowViewModel.GetNextPage(ViewModel.CurrentPage_t, ViewModel.ShortcutPages));
+        e.Handled = true;
     }
 
     private void Window_KeyDown(object? sender, KeyEventArgs e)
@@ -285,56 +414,82 @@ public partial class MainWindow : Window
             return;
         }
 
-        bool isCtrl = e.KeyModifiers.HasFlag(KeyModifiers.Control);
+        // ⌘ on macOS, Ctrl elsewhere. Handled keys are marked so the macOS menu bar's key
+        // equivalents for the same actions don't run them a second time.
+        bool isCtrl = PlatformShortcuts.HasPrimary(e.KeyModifiers);
         bool isShift = e.KeyModifiers.HasFlag(KeyModifiers.Shift);
 
-        if (e.Key == Key.Tab && isCtrl)
-        {
-            _focusSidebarSelectionOnNextPageChange = true;
-            ViewModel.NavigateTo(isShift
-                ? MainWindowViewModel.GetPreviousPage(ViewModel.CurrentPage_t)
-                : MainWindowViewModel.GetNextPage(ViewModel.CurrentPage_t));
-        }
-        else if (!isCtrl && !isShift && e.Key == Key.F1)
+        if (!isCtrl && !isShift && e.Key == Key.F1)
         {
             ViewModel.NavigateTo(PageType.Help);
+            e.Handled = true;
         }
-        else if ((e.Key is Key.Q or Key.W) && isCtrl)
+        // On macOS ⌘Q is the application menu's Quit; only ⌘W closes the window here.
+        else if (isCtrl && (e.Key == Key.W || (e.Key == Key.Q && !OperatingSystem.IsMacOS())))
         {
             Close();
+            e.Handled = true;
         }
         else if (e.Key == Key.F5 || (e.Key == Key.R && isCtrl))
         {
-            (ViewModel.CurrentPageContent as IKeyboardShortcutListener)?.ReloadTriggered();
+            TriggerPageReload();
+            e.Handled = true;
         }
         else if (e.Key == Key.F && isCtrl)
         {
-            (ViewModel.CurrentPageContent as IKeyboardShortcutListener)?.SearchTriggered();
+            TriggerPageSearch();
+            e.Handled = true;
         }
         else if (e.Key == Key.A && isCtrl)
         {
-            (ViewModel.CurrentPageContent as IKeyboardShortcutListener)?.SelectAllTriggered();
-        }
-        else if (isCtrl && !isShift && e.Key is Key.D1 or Key.D2 or Key.D3 or Key.D4 or Key.D5 or Key.D6)
-        {
-            _focusSidebarSelectionOnNextPageChange = true;
-            ViewModel.NavigateTo(e.Key switch
-            {
-                Key.D1 => PageType.Discover,
-                Key.D2 => PageType.Updates,
-                Key.D3 => PageType.Installed,
-                Key.D4 => PageType.Bundles,
-                Key.D5 => PageType.Settings,
-                _ => PageType.Managers,
-            });
+            TriggerPageSelectAll();
             e.Handled = true;
         }
-        else if (isCtrl && !isShift && e.Key == Key.D)
+        else if (isCtrl && !isShift && e.Key is >= Key.D1 and <= Key.D9
+                 && e.Key - Key.D1 <= ViewModel.ShortcutPages.Length)
         {
-            (ViewModel.CurrentPageContent as IKeyboardShortcutListener)?.DetailsTriggered();
+            var pages = ViewModel.ShortcutPages;
+            int index = e.Key - Key.D1;
+            if (index == pages.Length)
+            {
+                ShowMoreMenu();
+            }
+            else
+            {
+                _focusSidebarSelectionOnNextPageChange = true;
+                ViewModel.NavigateTo(pages[index]);
+            }
+            e.Handled = true;
+        }
+        else if (isCtrl && !isShift && (e.Key == Key.D || (OperatingSystem.IsMacOS() && e.Key == Key.I)))
+        {
+            TriggerPageDetails();
+            e.Handled = true;
+        }
+        else if (isCtrl && isShift && (e.Key == Key.D || (OperatingSystem.IsMacOS() && e.Key == Key.I)))
+        {
+            TriggerPageDetailsPane();
             e.Handled = true;
         }
     }
+
+    // The page that receives Reload/Find/Select All/Details, or null while a dialog is open; shared
+    // by the keyboard shortcuts and the macOS menu bar so both apply the same rule.
+    private IKeyboardShortcutListener? PageShortcutListener
+        => ModalLayer.IsVisible ? null : ViewModel.CurrentPageContent as IKeyboardShortcutListener;
+
+    private void TriggerPageReload() => PageShortcutListener?.ReloadTriggered();
+
+    private void TriggerPageSearch() => PageShortcutListener?.SearchTriggered();
+
+    private void TriggerPageSelectAll() => PageShortcutListener?.SelectAllTriggered();
+
+    private void TriggerPageDetails() => PageShortcutListener?.DetailsTriggered();
+
+    private IDetailsPaneHost? PageDetailsPaneHost
+        => PageShortcutListener is IDetailsPaneHost { CanToggleDetailsPane: true } host ? host : null;
+
+    private void TriggerPageDetailsPane() => PageDetailsPaneHost?.ToggleDetailsPane();
 
     private void OnCurrentPageChanged(object? sender, PageType pageType)
     {
@@ -347,11 +502,24 @@ public partial class MainWindow : Window
             return;
 
         _focusSidebarSelectionOnNextPageChange = false;
-        Dispatcher.UIThread.Post(() =>
-        {
-            var sidebar = this.GetVisualDescendants().OfType<SidebarView>().FirstOrDefault();
-            sidebar?.FocusSelectedItem();
-        }, DispatcherPriority.Background);
+        Dispatcher.UIThread.Post(() => ActiveSidebar()?.FocusSelectedItem(), DispatcherPriority.Background);
+    }
+
+    private void ShowMoreMenu()
+    {
+        if (!ViewModel.Sidebar.RailVisible && !ViewModel.Sidebar.NavDockVisible && !ViewModel.Sidebar.OverlayActive)
+            ViewModel.Sidebar.IsPaneOpen = true;
+
+        Dispatcher.UIThread.Post(() => ActiveSidebar()?.ShowMoreFlyout(), DispatcherPriority.Background);
+    }
+
+    private SidebarView? ActiveSidebar()
+    {
+        Control host = ViewModel.Sidebar.OverlayActive ? NavFlyout
+            : ViewModel.Sidebar.NavDockVisible ? NavDock
+            : NavRail;
+
+        return host.GetVisualDescendants().OfType<SidebarView>().FirstOrDefault();
     }
 
     private void BackButton_Click(object? sender, RoutedEventArgs e) => ViewModel.NavigateBack();
@@ -390,6 +558,10 @@ public partial class MainWindow : Window
         if (ContentRoot.RowDefinitions.Count < 3)
             return;
 
+        ContentRoot.RowDefinitions[1].Height = ViewModel.OperationsSplitterVisible
+            ? new GridLength(12, GridUnitType.Pixel)
+            : new GridLength(0, GridUnitType.Pixel);
+
         RowDefinition row = ContentRoot.RowDefinitions[2];
         if (ViewModel.OperationsPanelVisible && ViewModel.OperationsPanelExpanded)
         {
@@ -415,7 +587,7 @@ public partial class MainWindow : Window
             return 0;
 
         const double chrome = 42;
-        const double fallbackRow = 68;
+        const double fallbackRow = 56;
 
         double rows = 0;
         int visible = Math.Min(count, 3);
@@ -487,6 +659,15 @@ public partial class MainWindow : Window
     public void RefreshNavigationMode()
         => ViewModel.Sidebar.Mode = SidebarViewModel.ParseMode(Settings.GetValue(Settings.K.NavMenuMode));
 
+    public void ResetNavigationOrder() => ViewModel.Sidebar.ResetNavigationPages();
+
+    // Let the splitter hover surface replace the separator visually without changing its layout thickness.
+    private void OperationsSplitter_PointerEntered(object? sender, PointerEventArgs e)
+        => OperationsPanelBorder.Classes.Set("splitter-active", true);
+
+    private void OperationsSplitter_PointerExited(object? sender, PointerEventArgs e)
+        => OperationsPanelBorder.Classes.Set("splitter-active", false);
+
     // Light-dismiss: clicking outside the open flyout closes it (no darkening — the layer is transparent).
     private void FlyoutDismiss_PointerPressed(object? sender, PointerPressedEventArgs e)
         => ViewModel.Sidebar.IsPaneOpen = false;
@@ -522,7 +703,9 @@ public partial class MainWindow : Window
             // traffic lights' centre line (see ApplyMacTitleBarLayout / MAC_TRAFFIC_LIGHT_*).
             ExtendClientAreaToDecorationsHint = true;
             ExtendClientAreaTitleBarHeightHint = 44;
+            MacGlassWindowHelper.Apply(this);
             ApplyMacTitleBarControlSizes();
+            ApplyMacTitleBarChrome();
 
             // Drive height/inset from code rather than the AXAML bindings: in fullscreen the native
             // title bar is hidden and WindowDecorationMargin collapses to 0, which would clip the
@@ -543,7 +726,7 @@ public partial class MainWindow : Window
                 }
 
                 TitleBarGrid.Height = _macTitleBarHeight;
-                MainContentRoot.Margin = new Thickness(0, _macTitleBarHeight, 0, 0);
+                ApplyMacSidebarLayout();
 
                 if (fullScreen)
                 {
@@ -554,19 +737,43 @@ public partial class MainWindow : Window
                 }
                 else
                 {
-                    // Pin the row to the traffic lights: top-aligned, offset so its centre line
-                    // matches theirs, and inset far enough to clear the close/minimise/zoom cluster.
+                    // Inset the window buttons inside the floating glass sidebar, on the bar's centre line (the
+                    // search field's), as System Settings does; macOS resets them on every layout pass.
+                    MacGlassWindowHelper.SetWindowButtonsPosition(
+                        this, MAC_GLASS_INSET + MAC_TRAFFIC_LIGHT_PANEL_PADDING, _macTitleBarHeight / 2);
+
+                    // Pin the row to the traffic lights where macOS actually placed them: their position
+                    // changes with the macOS version and the window state, so the constants are only a fallback.
+                    Rect? zoom = MacGlassWindowHelper.GetZoomButtonFrame(this);
+                    if (zoom != _lastMacZoomButtonFrame)
+                    {
+                        _lastMacZoomButtonFrame = zoom;
+                        Logger.Info($"macOS title bar: zoom button at {zoom?.ToString() ?? "unknown"}, window {WindowState}");
+                    }
+
+                    double inset = zoom is { } z ? z.Right + MAC_TRAFFIC_LIGHT_GAP : MAC_TRAFFIC_LIGHT_INSET;
+                    double centerY = zoom is { } c ? c.Center.Y : MAC_TRAFFIC_LIGHT_CENTER_Y;
                     HamburgerPanel.VerticalAlignment = VerticalAlignment.Top;
-                    HamburgerPanel.Margin = new Thickness(
-                        MAC_TRAFFIC_LIGHT_INSET,
-                        MAC_TRAFFIC_LIGHT_CENTER_Y - (MAC_TITLE_BAR_CONTROL_SIZE / 2),
-                        8,
-                        0);
+                    HamburgerPanel.Margin = new Thickness(inset, centerY - (MAC_TITLE_BAR_CONTROL_SIZE / 2), 8, 0);
                 }
             }
 
             this.GetObservable(WindowStateProperty).SubscribeValue(_ => ApplyMacTitleBarLayout());
             this.GetObservable(WindowDecorationMarginProperty).SubscribeValue(_ => ApplyMacTitleBarLayout());
+            // macOS lays the window buttons out again on resize and zoom; follow them.
+            this.GetObservable(ClientSizeProperty).SubscribeValue(_ => ApplyMacTitleBarLayout());
+            Opened += (_, _) => Dispatcher.UIThread.Post(ApplyMacTitleBarLayout, DispatcherPriority.Background);
+            NavRail.GetObservable(IsVisibleProperty).SubscribeValue(_ => ApplyMacSidebarLayout());
+            NavDock.GetObservable(IsVisibleProperty).SubscribeValue(_ => ApplyMacSidebarLayout());
+            SidebarGlass.GetObservable(BoundsProperty).SubscribeValue(_ => UpdateMacWindowSurfaceClip());
+            NavFlyout.GetObservable(BoundsProperty).SubscribeValue(_ => UpdateMacWindowSurfaceClip());
+            NavFlyout.GetObservable(OpacityProperty).SubscribeValue(_ => UpdateMacWindowSurfaceClip());
+            ViewModel.Sidebar.PropertyChanged += (_, e) =>
+            {
+                if (e.PropertyName == nameof(SidebarViewModel.OverlayActive))
+                    UpdateMacWindowSurfaceClip();
+            };
+            MacWindowSurface.GetObservable(BoundsProperty).SubscribeValue(_ => UpdateMacWindowSurfaceClip());
         }
         else if (OperatingSystem.IsWindows())
         {
@@ -622,6 +829,118 @@ public partial class MainWindow : Window
     /// a button centred on the traffic lights' centre line would overflow past the top of the window.
     /// The centred search pill is unaffected — it stays centred in the full 44 px bar.
     /// </summary>
+    // With the glass look the sidebar floats as an inset panel: the labelled dock runs full height
+    // around the traffic lights, while the narrow rail (and the overlay aligned to it) starts below them.
+    private void ApplyMacSidebarLayout()
+    {
+        double bar = _macTitleBarHeight;
+        var railMargin = new Thickness(MAC_GLASS_INSET, bar, MAC_GLASS_INSET, MAC_GLASS_INSET);
+        var dockMargin = new Thickness(MAC_GLASS_INSET);
+
+        MainContentRoot.Margin = default;
+        ContentRoot.Margin = new Thickness(0, bar, 0, 0);
+        NavRail.Margin = railMargin;
+        NavDock.Margin = dockMargin;
+        NavDock.Padding = new Thickness(0, bar - MAC_GLASS_INSET, 0, 0);
+        NavFlyout.Margin = new Thickness(MAC_GLASS_INSET, bar, 0, MAC_GLASS_INSET);
+
+        SidebarGlass.IsVisible = NavRail.IsVisible || NavDock.IsVisible;
+        SidebarGlass.Margin = NavDock.IsVisible ? dockMargin : railMargin;
+        MacWindowSurface.IsVisible = true;
+        UpdateMacWindowSurfaceClip();
+    }
+
+    // Punches the sidebar panel's rounded rect out of the opaque window surface, so the native
+    // vibrancy only shows through the panel (System Settings look) and the content stays solid.
+    // While the expanded overlay shows (including its fade-out) it is the hole, and the content
+    // beneath it is clipped away too, so the overlay shows the same glass instead of the page.
+    private void UpdateMacWindowSurfaceClip()
+    {
+        if (!MacWindowSurface.IsVisible)
+            return;
+
+        bool overlay = ViewModel.Sidebar.OverlayActive || NavFlyout.Opacity > 0;
+        Border? panel = overlay ? NavFlyout : SidebarGlass.IsVisible ? SidebarGlass : null;
+
+        foreach (var child in MainContentRoot.Children)
+        {
+            if (child != NavFlyout && child != FlyoutDismiss)
+                child.Clip = overlay ? ExcludePanel(child, NavFlyout) : null;
+        }
+
+        MacWindowSurface.Clip = panel is null ? null : ExcludePanel(MacWindowSurface, panel);
+    }
+
+    // The control's own bounds minus the panel's rounded rect, in the control's coordinates.
+    private static Geometry? ExcludePanel(Visual target, Border panel)
+    {
+        if (panel.TranslatePoint(default, target) is not { } origin)
+            return null;
+
+        double radius = panel.CornerRadius.TopLeft;
+        return new CombinedGeometry(
+            GeometryCombineMode.Exclude,
+            new RectangleGeometry(new Rect(target.Bounds.Size)),
+            new RectangleGeometry(new Rect(origin, panel.Bounds.Size), radius, radius));
+    }
+
+    // macOS title-bar idioms: the sidebar.left toggle and a back chevron instead of the hamburger and
+    // arrow, and search at the trailing end of the bar, as in Finder.
+    private void ApplyMacTitleBarChrome()
+    {
+        if (SidebarToggleButton.Content is global::Avalonia.Controls.Shapes.Path toggle)
+            toggle.Data = Geometry.Parse("M2.5,0.75 H13.5 A1.75,1.75 0 0 1 15.25,2.5 V11.5 A1.75,1.75 0 0 1 13.5,13.25 "
+                                         + "H2.5 A1.75,1.75 0 0 1 0.75,11.5 V2.5 A1.75,1.75 0 0 1 2.5,0.75 Z M5.75,0.75 V13.25");
+        if (BackButton.Content is global::Avalonia.Controls.Shapes.Path back)
+            back.Data = Geometry.Parse("M10,1 L4,7 L10,13");
+
+        // Back is a round glass button, like the back/forward capsule in System Settings.
+        BackButton.Bind(BackgroundProperty, this.GetResourceObservable("MacGlassControlBackground"));
+        BackButton.Bind(BorderBrushProperty, this.GetResourceObservable("MacGlassPanelBorderBrush"));
+        BackButton.BorderThickness = new Thickness(1);
+        BackButton.CornerRadius = new CornerRadius(MAC_TITLE_BAR_CONTROL_SIZE / 2);
+
+        // Apple: don't title windows with the app name; the page header already names the view.
+        TitleBarTextBlock.IsVisible = Settings.Get(Settings.K.ShowVersionNumberOnTitlebar);
+
+        Grid.SetColumn(GlobalSearchContainer, 2);
+        GlobalSearchContainer.HorizontalAlignment = HorizontalAlignment.Right;
+        GlobalSearchContainer.Margin = new Thickness(0, 0, MAC_SEARCH_TRAILING_INSET, 0);
+
+        // At the trailing end the field has only its column's width, so it shrinks on narrow windows.
+        GlobalSearchGrid.ColumnDefinitions[0].Width = GridLength.Star;
+        TitleBarGrid.GetObservable(BoundsProperty).SubscribeValue(_ =>
+        {
+            double available = TitleBarGrid.ColumnDefinitions[2].ActualWidth - MAC_SEARCH_TRAILING_INSET;
+            GlobalSearchContainer.Width = Math.Clamp(available, MAC_SEARCH_MIN_WIDTH, MAC_SEARCH_MAX_WIDTH);
+        });
+
+        // Dialogs already render as in-window sheets; give them the rounder macOS 26 sheet shape.
+        ModalSurface.CornerRadius = new CornerRadius(20);
+        ModalOutline.CornerRadius = new CornerRadius(20);
+        ModalOutline.Bind(Border.BorderBrushProperty, this.GetResourceObservable("MacGlassPanelBorderBrush"));
+
+        // Sheet close: a round glass ✕ on the leading edge, not the red Windows caption button.
+        ModalCloseButton.Classes.Remove("caption");
+        ModalCloseButton.Classes.Remove("caption-close");
+        Grid.SetColumn(ModalCloseButton, 0);
+        ModalCloseButton.HorizontalAlignment = HorizontalAlignment.Left;
+        ModalCloseButton.VerticalAlignment = VerticalAlignment.Center;
+        ModalCloseButton.Margin = new Thickness(MAC_SHEET_CLOSE_INSET, 0, 0, 0);
+        ModalCloseButton.Width = MAC_SHEET_CLOSE_SIZE;
+        ModalCloseButton.Height = MAC_SHEET_CLOSE_SIZE;
+        ModalCloseButton.Padding = new Thickness(0);
+        ModalCloseButton.CornerRadius = new CornerRadius(MAC_SHEET_CLOSE_SIZE / 2);
+        ModalCloseButton.BorderThickness = new Thickness(1);
+        ModalCloseButton.Bind(BackgroundProperty, this.GetResourceObservable("MacGlassControlBackground"));
+        ModalCloseButton.Bind(BorderBrushProperty, this.GetResourceObservable("MacGlassPanelBorderBrush"));
+        if (ModalCloseButton.Content is SvgIcon glyph)
+        {
+            glyph.Width = 10;
+            glyph.Height = 10;
+        }
+    }
+
     private void ApplyMacTitleBarControlSizes()
     {
         foreach (Button button in new[] { BackButton, SidebarToggleButton })
@@ -832,10 +1151,15 @@ public partial class MainWindow : Window
         {
             // Width/Height stay NaN until the window has been laid out, which never happens on a
             // daemon launch the user has not opened yet. Saving then would persist a 0x0 size.
-            if (double.IsNaN(Width) || double.IsNaN(Height))
+            if (!_hasOpened || double.IsNaN(Width) || double.IsNaN(Height))
                 return;
 
             int state = WindowState == WindowState.Maximized ? 1 : 0;
+            if (state == 0 && _unsavedPlacement is { } unsaved
+                && WindowPlacement.IsSamePlacement(unsaved, Position, Width, Height))
+                return;
+
+            _unsavedPlacement = null;
             string geometry = $"v2,{Position.X},{Position.Y},{(int)Width},{(int)Height},{state}";
             Settings.SetValue(Settings.K.WindowGeometry, geometry);
         }
@@ -849,12 +1173,16 @@ public partial class MainWindow : Window
     {
         string geometry = Settings.GetValue(Settings.K.WindowGeometry);
         if (string.IsNullOrEmpty(geometry))
+        {
+            ApplyDefaultGeometry();
             return;
+        }
 
         string[] items = geometry.Split(',');
         if (items.Length is not (5 or 6))
         {
             Logger.Warn($"The restored geometry did not have a supported item count (found length was {items.Length})");
+            ApplyDefaultGeometry();
             return;
         }
 
@@ -882,6 +1210,7 @@ public partial class MainWindow : Window
         {
             Logger.Error("Could not parse window geometry integers");
             Logger.Error(ex);
+            ApplyDefaultGeometry();
             return;
         }
 
@@ -892,67 +1221,60 @@ public partial class MainWindow : Window
             // Mirror WinUI behaviour: don't reapply the saved (maximized) bounds, just
             // maximize. The OS / Avalonia picks a sensible un-maximize restore size.
             WindowState = WindowState.Maximized;
+            return;
         }
-        else if (IsRectangleFullyVisible(x, y, width, height))
+
+        var screens = GetPlacementScreens();
+        var placement = new WindowPlacementResult(new PixelPoint(x, y), width, height);
+        if (!WindowPlacement.IsFullyVisible(screens, placement.Position, width, height))
         {
-            Width = width;
-            Height = height;
-            Position = new PixelPoint(x, y);
-            // On Windows our WM_NCCALCSIZE makes the client rect equal the full window rect, so the
-            // saved size is the outer size. Avalonia's Width/Height setter re-adds WS_THICKFRAME via
-            // AdjustWindowRectEx, inflating the window a little on every restart; OnOpened restores
-            // the exact outer rect natively to cancel that drift.
-            if (OperatingSystem.IsWindows())
-            {
-                _pendingRestoreWidth = width;
-                _pendingRestoreHeight = height;
-            }
+            placement = WindowPlacement.FitSaved(screens, placement.Position, width, height, MinWidth, MinHeight);
+            _unsavedPlacement = placement;
+            Logger.Warn($"Restored geometry was outside of desktop bounds, fitted it to {placement}");
         }
-        else
+
+        ApplyPlacement(placement);
+    }
+
+    private void ApplyDefaultGeometry()
+    {
+        var screens = GetPlacementScreens();
+        if (screens.Count == 0)
+            return;
+
+        int primary = Math.Max(0, screens.FindIndex(screen => screen.IsPrimary));
+        var placement = WindowPlacement.ForDefault(screens[primary], DefaultWindowWidth, DefaultWindowHeight, MinWidth, MinHeight);
+        _unsavedPlacement = placement;
+        WindowStartupLocation = WindowStartupLocation.Manual;
+        ApplyPlacement(placement);
+    }
+
+    private void ApplyPlacement(WindowPlacementResult placement)
+    {
+        Width = placement.Width;
+        Height = placement.Height;
+        Position = placement.Position;
+        // On Windows our WM_NCCALCSIZE makes the client rect equal the full window rect, so the
+        // saved size is the outer size. Avalonia's Width/Height setter re-adds WS_THICKFRAME via
+        // AdjustWindowRectEx, inflating the window a little on every restart; OnOpened restores
+        // the exact outer rect natively to cancel that drift.
+        if (OperatingSystem.IsWindows())
         {
-            Logger.Warn("Restored geometry was outside of desktop bounds");
+            _pendingRestoreWidth = placement.Width;
+            _pendingRestoreHeight = placement.Height;
         }
     }
 
-    private bool IsRectangleFullyVisible(int x, int y, int width, int height)
+    private List<PlacementScreen> GetPlacementScreens()
     {
-        // Position is in screen pixels, Width/Height are DIPs. Scale width/height
-        // by the DPI of the screen that contains the saved position before comparing
-        // against the union of all monitor bounds (which Avalonia reports in pixels).
-        var screens = Screens?.All;
-        if (screens is null || screens.Count == 0)
-            return true;
+        var result = new List<PlacementScreen>();
+        var screens = Screens;
+        if (screens is null)
+            return result;
 
-        int minX = int.MaxValue, minY = int.MaxValue;
-        int maxX = int.MinValue, maxY = int.MinValue;
-        double hostScaling = 1.0;
-        bool foundHost = false;
-
-        foreach (var screen in screens)
-        {
-            var bounds = screen.Bounds;
-            if (bounds.X < minX) minX = bounds.X;
-            if (bounds.Y < minY) minY = bounds.Y;
-            if (bounds.X + bounds.Width > maxX) maxX = bounds.X + bounds.Width;
-            if (bounds.Y + bounds.Height > maxY) maxY = bounds.Y + bounds.Height;
-
-            if (!foundHost && bounds.Contains(new PixelPoint(x, y)))
-            {
-                hostScaling = screen.Scaling;
-                foundHost = true;
-            }
-        }
-
-        if (!foundHost)
-            hostScaling = Screens?.Primary?.Scaling ?? 1.0;
-
-        int widthPx = (int)(width * hostScaling);
-        int heightPx = (int)(height * hostScaling);
-
-        if (x + 10 < minX || x + widthPx - 10 > maxX || y + 10 < minY || y + heightPx - 10 > maxY)
-            return false;
-
-        return true;
+        foreach (var screen in screens.All)
+            result.Add(new PlacementScreen(screen.Bounds, screen.WorkingArea, screen.Scaling, screen.IsPrimary));
+        return result;
     }
 
     private void MinimizeButton_Click(object? sender, RoutedEventArgs e)
@@ -967,13 +1289,13 @@ public partial class MainWindow : Window
 
     private void UpdateMaximizeButtonState(bool isMaximized)
     {
-        MaximizeIcon.Data = Geometry.Parse(
-            isMaximized
-                ? "M3,0 H10 V7 H8 V2 H3 Z M0,3 H7 V10 H0 Z"
-                : "M0,0 H10 V10 H0 Z");
-        ToolTip.SetTip(
-            MaximizeButton,
-            CoreTools.Translate(isMaximized ? "Restore" : "Maximize"));
+        MaximizeIcon.IsVisible = !isMaximized;
+        RestoreIcon.IsVisible = isMaximized && OperatingSystem.IsWindows();
+        RestoreFallbackIcon.IsVisible = isMaximized && !OperatingSystem.IsWindows();
+
+        string label = CoreTools.Translate(isMaximized ? "Restore" : "Maximize");
+        ToolTip.SetTip(MaximizeButton, label);
+        AutomationProperties.SetName(MaximizeButton, label);
     }
 
     // True when the WM_NCHITTEST screen point (physical px in lParam) falls within the maximize
@@ -1018,6 +1340,60 @@ public partial class MainWindow : Window
     {
         long packed = lParam.ToInt64();
         return (unchecked((short)(packed & 0xFFFF)), unchecked((short)((packed >> 16) & 0xFFFF)));
+    }
+
+    private static int HitTestResizeBorder(nint hWnd, nint lParam)
+    {
+        if (NativeMethods.IsZoomed(hWnd))
+            return HTNOWHERE;
+
+        uint style = (uint)NativeMethods.GetWindowLongPtr(hWnd, GWL_STYLE).ToInt64();
+        if ((style & WS_THICKFRAME) == 0)
+            return HTNOWHERE;
+
+        if (!NativeMethods.GetWindowRect(hWnd, out NativeMethods.RECT window))
+            return HTNOWHERE;
+
+        uint dpi = NativeMethods.GetDpiForWindow(hWnd);
+        if (dpi == 0) dpi = 96;
+
+        var frame = default(NativeMethods.RECT);
+        var border = default(NativeMethods.RECT);
+        if (!NativeMethods.AdjustWindowRectExForDpi(ref frame, style, false, 0, dpi)
+            || !NativeMethods.AdjustWindowRectExForDpi(ref border, style & ~WS_CAPTION, false, 0, dpi))
+            return HTNOWHERE;
+
+        var (x, y) = ScreenPointFromLParam(lParam);
+
+        int column = 1;
+        if (x >= window.Left && x < window.Left - frame.Left)
+            column = 0;
+        else if (x < window.Right && x >= window.Right - frame.Right)
+            column = 2;
+
+        int row = 1;
+        if (y >= window.Top && y < window.Top - frame.Top)
+        {
+            if (y < window.Top - border.Top)
+                row = 0;
+        }
+        else if (y < window.Bottom && y >= window.Bottom - frame.Bottom)
+        {
+            row = 2;
+        }
+
+        return ((row * 3) + column) switch
+        {
+            0 => HTTOPLEFT,
+            1 => HTTOP,
+            2 => HTTOPRIGHT,
+            3 => HTLEFT,
+            5 => HTRIGHT,
+            6 => HTBOTTOMLEFT,
+            7 => HTBOTTOM,
+            8 => HTBOTTOMRIGHT,
+            _ => HTNOWHERE,
+        };
     }
 
     // Emulates the button's pointer-over/pressed fill (lost once input is non-client) using the
@@ -1147,6 +1523,8 @@ public partial class MainWindow : Window
             trayOwner.UpdateSystemTrayStatus();
         }
 
+        int borderEdge = msg == WM_NCHITTEST ? HitTestResizeBorder(hWnd, lParam) : HTNOWHERE;
+
         // ── Snap Layouts: report HTMAXBUTTON over the custom maximize button so Win11 shows the
         // layout flyout, and emulate hover/press/click since input now arrives as NC messages. ──
         if (Instance is { } self && self.WindowButtons.IsVisible)
@@ -1154,6 +1532,11 @@ public partial class MainWindow : Window
             switch (msg)
             {
                 case WM_NCHITTEST:
+                    if (borderEdge is not HTNOWHERE and not HTTOP)
+                    {
+                        handled = true;
+                        return borderEdge;
+                    }
                     if (self.HitTestMaximizeButton(lParam))
                     {
                         handled = true;
@@ -1204,6 +1587,12 @@ public partial class MainWindow : Window
                     handled = true;   // the down/up pair already toggled; swallow the follow-up dblclk
                     return 0;
             }
+        }
+
+        if (borderEdge != HTNOWHERE)
+        {
+            handled = true;
+            return borderEdge;
         }
 
         // Force client = full window rect. Avalonia's ExtendClientArea handler only overrides
@@ -1337,6 +1726,10 @@ public partial class MainWindow : Window
         [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool AdjustWindowRectExForDpi(ref RECT lpRect, uint dwStyle, [MarshalAs(UnmanagedType.Bool)] bool bMenu, uint dwExStyle, uint dpi);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool GetWindowRect(nint hWnd, out RECT lpRect);
 
         [DllImport("user32.dll")]
         public static extern nint MonitorFromWindow(nint hwnd, uint dwFlags);
@@ -1686,6 +2079,11 @@ public partial class MainWindow : Window
                 if (index >= 0)
                     _modalStack.RemoveAt(index);
                 _modalFocusHistory.Remove(dialog);
+                if (_modalMinimumSizeHistory.Remove(dialog, out var minimumSize))
+                {
+                    dialog.MinWidth = minimumSize.MinWidth;
+                    dialog.MinHeight = minimumSize.MinHeight;
+                }
 
                 if (opened)
                 {
@@ -1732,11 +2130,16 @@ public partial class MainWindow : Window
 
     private void PresentModal(ImmersiveDialog dialog)
     {
+        _modalMinimumSizeHistory.TryAdd(dialog, (dialog.MinWidth, dialog.MinHeight));
         _modalTitleSubscription?.Dispose();
         _modalTitleSubscription = dialog.GetObservable(ImmersiveDialog.TitleProperty)
             .SubscribeValue(title => ModalTitle.Text = title ?? "");
         ModalCloseButton.IsVisible = dialog.IsCloseButtonVisible;
-        ModalTitle.Margin = dialog.TitleMargin;
+        // On macOS the close button sits on the leading edge, so the title starts after it.
+        ModalTitle.Margin = OperatingSystem.IsMacOS() && dialog.IsCloseButtonVisible
+            ? new Thickness(MAC_SHEET_CLOSE_INSET + MAC_SHEET_CLOSE_SIZE + 12, dialog.TitleMargin.Top,
+                dialog.TitleMargin.Right, dialog.TitleMargin.Bottom)
+            : dialog.TitleMargin;
         ModalContent.Content = dialog;
         ModalLayer.IsVisible = true;
         UpdateModalSurfaceSize();
@@ -1790,6 +2193,29 @@ public partial class MainWindow : Window
     private void ModalCloseButton_Click(object? sender, RoutedEventArgs e) =>
         (ModalContent.Content as ImmersiveDialog)?.Close();
 
+    private void ModalLayer_PointerPressed(object? sender, PointerPressedEventArgs e) =>
+        _modalBackdropPressed = ReferenceEquals(e.Source, ModalLayer)
+            && e.GetCurrentPoint(ModalLayer).Properties.IsLeftButtonPressed;
+
+    private void ModalLayer_PointerReleased(object? sender, PointerReleasedEventArgs e)
+    {
+        bool pressedOnBackdrop = _modalBackdropPressed;
+        _modalBackdropPressed = false;
+        if (!pressedOnBackdrop
+            || e.InitialPressMouseButton != MouseButton.Left
+            || ModalSurface.Bounds.Contains(e.GetPosition(ModalLayer)))
+            return;
+
+        if (ModalContent.Content is ImmersiveDialog dialog)
+        {
+            e.Handled = true;
+            dialog.Close();
+        }
+    }
+
+    private void ModalLayer_PointerCaptureLost(object? sender, PointerCaptureLostEventArgs e) =>
+        _modalBackdropPressed = false;
+
     private void UpdateModalSurfaceSize()
     {
         if (ModalContent.Content is not ImmersiveDialog dialog)
@@ -1810,6 +2236,13 @@ public partial class MainWindow : Window
         ModalSurface.Height = double.IsFinite(dialog.MaxHeight)
             ? Math.Min(dialog.MaxHeight, ModalSurface.MaxHeight)
             : double.NaN;
+
+        if (_modalMinimumSizeHistory.TryGetValue(dialog, out var minimumSize))
+        {
+            dialog.MinWidth = Math.Min(minimumSize.MinWidth, ModalSurface.MaxWidth);
+            double availableContentHeight = Math.Max(0, ModalSurface.MaxHeight - ModalHeader.Height);
+            dialog.MinHeight = Math.Min(minimumSize.MinHeight, availableContentHeight);
+        }
     }
 
     private async Task AnimateModalAsync(bool opening)
@@ -1946,25 +2379,35 @@ public partial class MainWindow : Window
         AvaloniaOperationRegistry.PromptPendingShortcutsIfAny();
     }
 
-    public bool IsQuitting => Interlocked.CompareExchange(ref _isQuitting, 0, 0) == 1;
+    public bool IsQuitting => _shutdownCoordinator.IsQuitting;
 
-    public void QuitApplication()
+    internal bool HasUnsavedWork => ViewModel.HasUnsavedWork;
+
+    internal bool CanQuitWithoutAsking => ViewModel.CanShutdownWithoutAsking;
+
+    public void QuitApplication() => _ = RequestQuitApplicationAsync();
+
+    internal Task<bool> RequestQuitApplicationAsync(Action? onAuthorized = null) =>
+        _shutdownCoordinator.RequestAsync(
+            () => ViewModel.CanShutdownAsync(),
+            ShutdownApplicationAsync,
+            onAuthorized);
+
+    private async Task ShutdownApplicationAsync()
     {
-        if (Interlocked.Exchange(ref _isQuitting, 1) == 1)
-            return;
-
         _allowClose = true;
         ReleaseWindowResources();
 
         if (IsVisible)
             Hide();
 
-        _ = QuitApplicationAsync();
+        await StopAndExitApplicationAsync();
     }
 
-    private static async Task QuitApplicationAsync()
+    private static async Task StopAndExitApplicationAsync()
     {
         Logger.Warn("Quitting UniGetUI");
+        await AvaloniaAutoUpdater.WaitForInstallerHandoffAsync();
         try
         {
             await AvaloniaBootstrapper.StopIpcApiAsync().WaitAsync(TimeSpan.FromSeconds(5));

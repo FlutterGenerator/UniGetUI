@@ -37,6 +37,8 @@ namespace UniGetUI.PackageEngine.PackageLoader
 
         public bool LastLoadReportedFailures { get; private set; }
 
+        public bool HasPendingInitialLoad => !IsLoaded && !LastLoadReportedFailures;
+
         public DateTime? LastLoadFinishedUtc { get; private set; }
 
         private TaskCompletionSource? _loadCompletion;
@@ -55,6 +57,8 @@ namespace UniGetUI.PackageEngine.PackageLoader
         }
 
         protected readonly ConcurrentDictionary<long, IPackage> PackageReference;
+
+        private readonly ConcurrentDictionary<long, bool> _rememberedSelection = new();
 
         /// <summary>
         /// Fires when a block of packages (one package or more) is added or removed to the loader
@@ -78,6 +82,12 @@ namespace UniGetUI.PackageEngine.PackageLoader
         protected string LOADER_IDENTIFIER;
         private int LoadOperationIdentifier;
         protected IReadOnlyList<IPackageManager> Managers { get; private set; }
+
+        /// <summary>
+        /// True when at least one of this loader's managers is ready. When none is, a reload runs nothing
+        /// and an empty list says nothing about the packages on this device.
+        /// </summary>
+        public bool AnyManagerReady => Managers.Any(manager => manager.IsReady());
 
         public AbstractPackageLoader(
             IReadOnlyList<IPackageManager> managers,
@@ -111,6 +121,12 @@ namespace UniGetUI.PackageEngine.PackageLoader
 
         private void CompleteCurrentLoad()
             => Interlocked.Exchange(ref _loadCompletion, null)?.TrySetResult();
+
+        private void CompleteLoad(TaskCompletionSource completion)
+        {
+            Interlocked.CompareExchange(ref _loadCompletion, null, completion);
+            completion.TrySetResult();
+        }
 
         protected virtual bool DidManagerReportFailure(IPackageManager manager) => false;
 
@@ -148,6 +164,9 @@ namespace UniGetUI.PackageEngine.PackageLoader
         /// </summary>
         public virtual async Task ReloadPackages()
         {
+            TaskCompletionSource? completion = null;
+            int current_identifier = 0;
+            bool finishWasAnnounced = false;
             try
             {
                 if (DISABLE_RELOAD)
@@ -163,14 +182,16 @@ namespace UniGetUI.PackageEngine.PackageLoader
                 }
 
                 LoadOperationIdentifier = new Random().Next();
-                int current_identifier = LoadOperationIdentifier;
-                Volatile.Write(
-                    ref _loadCompletion,
-                    new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+                current_identifier = LoadOperationIdentifier;
+                completion = new TaskCompletionSource(
+                    TaskCreationOptions.RunContinuationsAsynchronously
                 );
+                Volatile.Write(ref _loadCompletion, completion);
                 IsLoading = true;
                 LastLoadReportedFailures = false;
                 StartedLoading?.Invoke(this, EventArgs.Empty);
+
+                RememberSelectionState();
 
                 // Clear packages only after signaling the load started, so the UI shows the
                 // loading state instead of briefly flashing the "no packages found" message.
@@ -178,7 +199,7 @@ namespace UniGetUI.PackageEngine.PackageLoader
                 IsLoaded = false;
                 InvokePackagesChangedEvent(false, [], []);
 
-                if (REQUIRES_INTERNET)
+                if (REQUIRES_INTERNET && WillQueryAnyManager())
                 {
                     await CoreTools.WaitForInternetConnection();
                 }
@@ -224,7 +245,7 @@ namespace UniGetUI.PackageEngine.PackageLoader
                                     }
 
                                     toAdd.Add(package);
-                                    await AddPackage(package);
+                                    await AddPackage(package, restoreSelection: true);
                                 }
 
                                 InvokePackagesChangedEvent(true, toAdd, []);
@@ -241,24 +262,43 @@ namespace UniGetUI.PackageEngine.PackageLoader
                         LastLoadReportedFailures = true;
                 }
 
+                IsLoading = false;
+
                 if (LoadOperationIdentifier == current_identifier)
                 {
                     LastLoadFinishedUtc = DateTime.UtcNow;
-                    InvokeFinishedLoadingEvent();
                     IsLoaded = true;
+                    finishWasAnnounced = true;
+                    InvokeFinishedLoadingEvent();
                 }
-
-                IsLoading = false;
             }
             catch (Exception ex)
             {
                 Logger.Error(ex);
-                LastLoadReportedFailures = true;
-                IsLoading = false;
+
+                if (
+                    !finishWasAnnounced
+                    && completion is not null
+                    && LoadOperationIdentifier == current_identifier
+                )
+                {
+                    LastLoadReportedFailures = true;
+                    IsLoading = false;
+
+                    try
+                    {
+                        InvokeFinishedLoadingEvent();
+                    }
+                    catch (Exception announceEx)
+                    {
+                        Logger.Error(announceEx);
+                    }
+                }
             }
             finally
             {
-                CompleteCurrentLoad();
+                if (completion is not null)
+                    CompleteLoad(completion);
             }
         }
 
@@ -273,6 +313,8 @@ namespace UniGetUI.PackageEngine.PackageLoader
             IsLoading = false;
             InvokePackagesChangedEvent(false, [], []);
         }
+
+        protected virtual bool WillQueryAnyManager() => true;
 
         /// <summary>
         /// Loads the packages from the given manager
@@ -313,12 +355,25 @@ namespace UniGetUI.PackageEngine.PackageLoader
             return ALLOW_MULTIPLE_PACKAGE_VERSIONS ? package.GetVersionedHash() : package.GetHash();
         }
 
-        protected async Task AddPackage(IPackage package)
+        private void RememberSelectionState()
+        {
+            _rememberedSelection.Clear();
+            foreach (var entry in PackageReference)
+            {
+                _rememberedSelection[entry.Key] = entry.Value.IsChecked;
+            }
+        }
+
+        protected async Task AddPackage(IPackage package, bool restoreSelection = false)
         {
             if (Contains(package))
                 return;
 
-            package.IsChecked = PACKAGES_CHECKED_BY_DEFAULT;
+            package.IsChecked =
+                restoreSelection
+                && _rememberedSelection.TryGetValue(HashPackage(package), out bool wasChecked)
+                    ? wasChecked
+                    : PACKAGES_CHECKED_BY_DEFAULT;
             await WhenAddingPackage(package);
             PackageReference.TryAdd(HashPackage(package), package);
         }

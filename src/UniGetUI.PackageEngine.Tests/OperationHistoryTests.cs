@@ -1,4 +1,5 @@
 using UniGetUI.PackageEngine.Enums;
+using UniGetUI.PackageEngine.Interfaces;
 using UniGetUI.PackageEngine.Operations;
 using UniGetUI.PackageEngine.Operations.History;
 using UniGetUI.PackageEngine.Serializable;
@@ -107,6 +108,7 @@ public sealed class OperationHistoryTests : IDisposable
         var record = Record("persisted");
         record.Output.Add(new OperationHistoryOutputLine { Text = "line one", Type = "Information" });
         record.Output.Add(new OperationHistoryOutputLine { Text = "boom", Type = "Error" });
+        record.RanElevated = true;
         OperationHistoryStore.Add(record);
 
         // Drop the in-memory cache so the next read must deserialize the file.
@@ -118,7 +120,50 @@ public sealed class OperationHistoryTests : IDisposable
         Assert.Equal(2, reloaded.Output.Count);
         Assert.Equal("boom", reloaded.Output[1].Text);
         Assert.Equal("Error", reloaded.Output[1].Type);
+        Assert.True(reloaded.RanElevated);
     }
+
+    [Fact]
+    public void PersistsANonElevatedRunAsFalseRatherThanUnknown()
+    {
+        var record = Record("standard");
+        record.RanElevated = false;
+        OperationHistoryStore.Add(record);
+        OperationHistoryStore.InvalidateCache();
+
+        var reloaded = OperationHistoryStore.Get("standard");
+        Assert.NotNull(reloaded);
+        Assert.False(reloaded!.RanElevated);
+    }
+
+    [Fact]
+    public void RecordsWrittenBeforeElevationWasTrackedReloadAsUnknown()
+    {
+        File.WriteAllText(_tempFile, LegacyRecordJson);
+        OperationHistoryStore.InvalidateCache();
+
+        var reloaded = OperationHistoryStore.Get("legacy");
+        Assert.NotNull(reloaded);
+        Assert.Equal("Contoso.Legacy", reloaded!.PackageId);
+        Assert.Null(reloaded.RanElevated);
+    }
+
+    private const string LegacyRecordJson = """
+        [
+          {
+            "Id": "legacy",
+            "Kind": "install-package",
+            "Role": 0,
+            "PackageId": "Contoso.Legacy",
+            "PackageName": "Contoso Legacy",
+            "ManagerName": "winget",
+            "SourceName": "winget",
+            "Status": "succeeded",
+            "TimestampUtc": "2026-01-01T00:00:00.0000000Z",
+            "Output": []
+          }
+        ]
+        """;
 
     [Fact]
     public void CapsAtMaxEntries()
@@ -221,6 +266,141 @@ public sealed class OperationHistoryTests : IDisposable
         Assert.Equal(manager.Id, record.ManagerName);
         Assert.Equal("1.2.3", record.VersionAfter);
         Assert.Equal(OperationHistoryRecord.StatusSucceeded, record.Status);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void FromOperation_CapturesTheElevationTheOperationRanWith(bool elevated)
+    {
+        var manager = new PackageManagerBuilder().WithName("Scoop").Build();
+        var package = new PackageBuilder()
+            .WithManager(manager)
+            .WithId("Contoso.Tool")
+            .WithVersion("1.2.3")
+            .Build();
+
+        using var op = new ElevationStubInstallOperation(package, new InstallOptions(), elevated);
+        var record = OperationHistoryRecord.FromOperation(op, OperationHistoryRecord.StatusSucceeded);
+
+        Assert.Equal(elevated, record.RanElevated);
+    }
+
+    private sealed class ElevationStubInstallOperation : InstallPackageOperation
+    {
+        private readonly bool _elevated;
+
+        public ElevationStubInstallOperation(IPackage package, InstallOptions options, bool elevated)
+            : base(package, options, IgnoreParallelInstalls: true)
+        {
+            _elevated = elevated;
+        }
+
+        public override bool WillRunElevated => _elevated;
+    }
+
+    // The package a Discover install starts from carries the feed's LATEST version, while the
+    // user may have pinned an older one in the install options. Recording the package version
+    // then claims a version that was never installed - and the retry-from-history flow rebuilds
+    // the package from these fields.
+    [Fact]
+    public void FromOperation_Install_RecordsThePinnedVersionRatherThanTheLatest()
+    {
+        var manager = new PackageManagerBuilder().WithName("Scoop").Build();
+        var package = new PackageBuilder()
+            .WithManager(manager)
+            .WithId("Contoso.Tool")
+            .WithVersion("3.0.3")
+            .Build();
+
+        using var op = new InstallPackageOperation(
+            package,
+            new InstallOptions { Version = "2.1.7" },
+            IgnoreParallelInstalls: true
+        );
+        var record = OperationHistoryRecord.FromOperation(
+            op,
+            OperationHistoryRecord.StatusSucceeded
+        );
+
+        Assert.Equal("", record.VersionBefore);
+        Assert.Equal("2.1.7", record.VersionAfter);
+    }
+
+    [Fact]
+    public void FromOperation_Update_RecordsThePinnedVersionRatherThanTheNewVersion()
+    {
+        var manager = new PackageManagerBuilder().WithName("Scoop").Build();
+        var package = new PackageBuilder()
+            .WithManager(manager)
+            .WithId("Contoso.Tool")
+            .WithVersion("1.0.0")
+            .WithNewVersion("3.0.0")
+            .Build();
+
+        using var op = new UpdatePackageOperation(
+            package,
+            new InstallOptions { Version = "2.0.0" }
+        );
+        var record = OperationHistoryRecord.FromOperation(
+            op,
+            OperationHistoryRecord.StatusSucceeded
+        );
+
+        Assert.Equal("1.0.0", record.VersionBefore);
+        Assert.Equal("2.0.0", record.VersionAfter);
+    }
+
+    [Fact]
+    public void FromOperation_Uninstall_RecordsNoVersionAfterEvenWhenPinned()
+    {
+        var manager = new PackageManagerBuilder().WithName("Scoop").Build();
+        var package = new PackageBuilder()
+            .WithManager(manager)
+            .WithId("Contoso.Tool")
+            .WithVersion("1.0.0")
+            .Build();
+
+        using var op = new UninstallPackageOperation(
+            package,
+            new InstallOptions { Version = "2.0.0" }
+        );
+        var record = OperationHistoryRecord.FromOperation(
+            op,
+            OperationHistoryRecord.StatusSucceeded
+        );
+
+        Assert.Equal("1.0.0", record.VersionBefore);
+        Assert.Equal("", record.VersionAfter);
+    }
+
+    [Fact]
+    public void FromOperation_Update_IgnoresAnInstallOnlyPinnedVersion()
+    {
+        var manager = new PackageManagerBuilder()
+            .WithName("Scoop")
+            .ConfigureCapabilities(capabilities =>
+            {
+                capabilities.SupportsCustomVersionsOnUpdate = false;
+                return capabilities;
+            })
+            .Build();
+        var package = new PackageBuilder()
+            .WithManager(manager)
+            .WithId("jq")
+            .WithVersion("1.7.1")
+            .WithNewVersion("1.8.2")
+            .Build();
+
+        using var op = new UpdatePackageOperation(
+            package,
+            new InstallOptions { Version = "1.7.1" },
+            IgnoreParallelInstalls: true
+        );
+        var record = OperationHistoryRecord.FromOperation(op, OperationHistoryRecord.StatusSucceeded);
+
+        Assert.Equal("1.7.1", record.VersionBefore);
+        Assert.Equal("1.8.2", record.VersionAfter);
     }
 
     [Fact]

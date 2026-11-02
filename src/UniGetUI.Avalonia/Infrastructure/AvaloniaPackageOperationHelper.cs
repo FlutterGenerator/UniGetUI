@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using Avalonia.Controls;
 using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Platform.Storage;
 using CommunityToolkit.Mvvm.Input;
@@ -29,34 +30,31 @@ namespace UniGetUI.Avalonia.Infrastructure;
 /// </summary>
 internal static class AvaloniaPackageOperationHelper
 {
-    public static async Task UpdateAllAsync()
-    {
-        foreach (var pkg in UpgradablePackagesLoader.Instance.Packages.ToList())
-        {
-            var opts = await InstallOptionsFactory.LoadApplicableAsync(pkg);
-            if (PackageOperation.HasPendingOperation(pkg, OperationType.Update)) continue;
-            var op = new UpdatePackageOperation(pkg, opts);
-            op.OperationSucceeded += (_, _) => TelemetryHandler.UpdatePackage(pkg, TEL_OP_RESULT.SUCCESS);
-            op.OperationFailed += (_, _) => TelemetryHandler.UpdatePackage(pkg, TEL_OP_RESULT.FAILED);
-            AvaloniaOperationRegistry.Add(op);
-            _ = op.MainThread();
-        }
-    }
+    public static Task<IReadOnlyList<AbstractOperation>> UpdateAllAsync(bool background = false)
+        => UpdatePackagesAsync(UpgradablePackagesLoader.Instance.Packages.ToList(), background);
 
-    public static async Task UpdateAllForManagerAsync(string managerName)
+    public static Task<IReadOnlyList<AbstractOperation>> UpdateAllForManagerAsync(string managerName)
+        => UpdatePackagesAsync(UpgradablePackagesLoader.Instance.Packages
+            .Where(p => p.Manager.Id.Equals(managerName, StringComparison.OrdinalIgnoreCase))
+            .ToList());
+
+    private static async Task<IReadOnlyList<AbstractOperation>> UpdatePackagesAsync(
+        IReadOnlyList<IPackage> packages, bool background = false)
     {
-        foreach (var pkg in UpgradablePackagesLoader.Instance.Packages
-            .Where(p => p.Manager.Id == managerName)
-            .ToList())
+        List<AbstractOperation> started = [];
+        foreach (var pkg in packages)
         {
             var opts = await InstallOptionsFactory.LoadApplicableAsync(pkg);
             if (PackageOperation.HasPendingOperation(pkg, OperationType.Update)) continue;
-            var op = new UpdatePackageOperation(pkg, opts);
+            var op = new UpdatePackageOperation(pkg, opts) { IsBackgroundOperation = background };
             op.OperationSucceeded += (_, _) => TelemetryHandler.UpdatePackage(pkg, TEL_OP_RESULT.SUCCESS);
             op.OperationFailed += (_, _) => TelemetryHandler.UpdatePackage(pkg, TEL_OP_RESULT.FAILED);
             AvaloniaOperationRegistry.Add(op);
             _ = op.MainThread();
+            started.Add(op);
         }
+
+        return started;
     }
 
     public static async Task UpdateForIdAsync(string packageId)
@@ -75,6 +73,23 @@ internal static class AvaloniaPackageOperationHelper
         op.OperationFailed += (_, _) => TelemetryHandler.UpdatePackage(pkg, TEL_OP_RESULT.FAILED);
         AvaloniaOperationRegistry.Add(op);
         _ = op.MainThread();
+    }
+
+    internal static async Task<IStorageFolder?> GetDefaultDownloadFolderAsync(TopLevel win)
+    {
+        try
+        {
+            if (await Task.Run(InstallerDownloadLocation.ResolveStartDirectory) is not { } directory)
+                return null;
+
+            return await win.StorageProvider.TryGetFolderFromPathAsync(directory);
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn("Could not resolve the default installer download location:");
+            Logger.Warn(ex);
+            return null;
+        }
     }
 
     /// <summary>
@@ -99,6 +114,16 @@ internal static class AvaloniaPackageOperationHelper
         if (package.Details.InstallerUrl is null)
         {
             Logger.Warn($"No installer URL found for {package.Id}");
+            win.ShowBanner(
+                CoreTools.Translate("No installer is available for {0}", package.Name),
+                CoreTools.Translate(
+                    "{0} did not report a download address for this package. It may not be "
+                        + "offered for your system, or it may no longer exist on {1}.",
+                    package.Manager.DisplayName,
+                    package.Source.AsString_DisplayName
+                ),
+                MainWindow.RuntimeNotificationLevel.Error
+            );
             return;
         }
 
@@ -113,6 +138,7 @@ internal static class AvaloniaPackageOperationHelper
         var file = await win.StorageProvider.SaveFilePickerAsync(new FilePickerSaveOptions
         {
             SuggestedFileName = suggestedName,
+            SuggestedStartLocation = await GetDefaultDownloadFolderAsync(win),
             FileTypeChoices =
             [
                 new FilePickerFileType(CoreTools.Translate("Installer")) { Patterns = [$"*.{ext}"] },
@@ -141,14 +167,32 @@ internal static class AvaloniaPackageOperationHelper
     {
         if (MainWindow.Instance is not { } win) return;
 
-        var eligible = packages
+        var selected = packages.ToList();
+        var eligible = selected
             .Where(p => !p.Source.IsVirtualManager && p.Manager.Capabilities.CanDownloadInstaller)
             .ToList();
 
+        if (eligible.Count < selected.Count)
+        {
+            win.ShowBanner(
+                CoreTools.Translate("Some packages cannot be downloaded"),
+                CoreTools.Translate(
+                    "{0} of the {1} selected packages were skipped, because their package "
+                        + "manager cannot download installers or could not be found.",
+                    selected.Count - eligible.Count,
+                    selected.Count
+                ),
+                MainWindow.RuntimeNotificationLevel.Error
+            );
+        }
+
         if (eligible.Count == 0) return;
 
-        var folders = await win.StorageProvider.OpenFolderPickerAsync(
-            new FolderPickerOpenOptions { AllowMultiple = false });
+        var folders = await win.StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
+        {
+            AllowMultiple = false,
+            SuggestedStartLocation = await GetDefaultDownloadFolderAsync(win),
+        });
 
         var folder = folders.FirstOrDefault();
         var outputPath = folder?.TryGetLocalPath();
@@ -179,8 +223,11 @@ internal static class AvaloniaPackageOperationHelper
         TEL_InstallReferral referral,
         MainWindow win)
     {
-        var folders = await win.StorageProvider.OpenFolderPickerAsync(
-            new FolderPickerOpenOptions { AllowMultiple = false });
+        var folders = await win.StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
+        {
+            AllowMultiple = false,
+            SuggestedStartLocation = await GetDefaultDownloadFolderAsync(win),
+        });
         var folder = folders.FirstOrDefault();
         var outputPath = folder?.TryGetLocalPath();
         if (outputPath is null) return;

@@ -8,8 +8,12 @@ using UniGetUI.Core.Logging;
 using UniGetUI.Core.SettingsEngine;
 using UniGetUI.Core.Tools;
 using UniGetUI.Interface.Enums;
+using UniGetUI.PackageEngine.AgentBroker;
+using UniGetUI.PackageEngine.Classes.Manager;
 using UniGetUI.PackageEngine.Enums;
 using UniGetUI.PackageEngine.Interfaces;
+using UniGetUI.PackageEngine.Managers.NpmManager;
+using UniGetUI.PackageEngine.Managers.PipManager;
 using UniGetUI.PackageEngine.Operations;
 using UniGetUI.PackageEngine.PackageClasses;
 using UniGetUI.PackageEngine.PackageLoader;
@@ -18,12 +22,15 @@ using UniGetUI.PackageEngine.Structs;
 using UniGetUI.PackageEngine.Tests.Infrastructure.Builders;
 using UniGetUI.PackageEngine.Tests.Infrastructure.Fakes;
 using UniGetUI.PackageOperations;
+using BrokerApiArchitecture = Devolutions.Now.Policy.Api.Architecture;
 using BrokerApiCancelResponse = Devolutions.Now.Policy.Api.CancelResponse;
 using BrokerApiCapabilitiesResponse = Devolutions.Now.Policy.Api.CapabilitiesResponse;
 using BrokerApiConstants = Devolutions.Now.Policy.Api.BrokerApi;
 using BrokerApiDecision = Devolutions.Now.Policy.Api.Decision;
 using BrokerApiDecisionInfo = Devolutions.Now.Policy.Api.DecisionInfo;
 using BrokerApiElevation = Devolutions.Now.Policy.Api.Elevation;
+using BrokerApiErrorCode = Devolutions.Now.Policy.Api.ErrorCode;
+using BrokerApiErrorResponse = Devolutions.Now.Policy.Api.ErrorResponse;
 using BrokerApiEventChannel = Devolutions.Now.Policy.Api.EventChannel;
 using BrokerApiEventChannelKind = Devolutions.Now.Policy.Api.EventChannelKind;
 using BrokerApiExecutionResponse = Devolutions.Now.Policy.Api.ExecutionResponse;
@@ -39,7 +46,7 @@ using BrokerApiServerContext = Devolutions.Now.Policy.Api.ServerContext;
 using BrokerApiStatusResponse = Devolutions.Now.Policy.Api.StatusResponse;
 using BrokerClientErrorKind = Devolutions.Now.Policy.Client.BrokerClientErrorKind;
 using BrokerClientException = Devolutions.Now.Policy.Client.BrokerClientException;
-using BrokerJson = Devolutions.Now.Policy.Api.BrokerJson;
+using BrokerSerializer = Devolutions.Now.Policy.Api.BrokerSerializer;
 using BrokerTransportKind = Devolutions.Now.Policy.Api.Transport;
 using BrokerTransportRequest = Devolutions.Now.Policy.Client.BrokerTransportRequest;
 using BrokerTransportResponse = Devolutions.Now.Policy.Client.BrokerTransportResponse;
@@ -133,12 +140,12 @@ public sealed class PackageOperationsTests
             inner =>
             {
                 Assert.IsType<KillProcessOperation>(inner.Operation);
-                Assert.False(inner.MustSucceed);
+                Assert.True(inner.MustSucceed);
             },
             inner =>
             {
                 Assert.IsType<KillProcessOperation>(inner.Operation);
-                Assert.False(inner.MustSucceed);
+                Assert.True(inner.MustSucceed);
             },
             inner =>
             {
@@ -197,6 +204,233 @@ public sealed class PackageOperationsTests
             }
         );
         Assert.Contains("1.0.0 -> 3.0.0", operation.Metadata.OperationInformation);
+    }
+
+    // UninstallPreviousVersionsOnUpdate is the one destructive consumer of the per-manager
+    // version comparison: it queues every installed copy it considers superseded for removal.
+    // On a SemVer registry the pre-release IS superseded by its stable release and must be
+    // cleaned up, which the shared numeric comparison could never see.
+    [Fact]
+    public async Task UpdateOperationQueuesASupersededPreReleaseForUninstallOnSemVerManagers()
+    {
+        var manager = new Npm();
+        var package = new PackageBuilder()
+            .WithManager(manager)
+            .WithId("contoso-tool")
+            .WithVersion("2.0.0-rc1")
+            .WithNewVersion("2.0.0")
+            .Build();
+        InitializeLoaders();
+        await InstalledPackagesLoader.Instance.AddForeign(
+            new PackageBuilder()
+                .WithManager(manager)
+                .WithId("contoso-tool")
+                .WithVersion("2.0.0-rc1")
+                .Build()
+        );
+
+        using var operation = new UpdatePackageOperation(
+            package,
+            new InstallOptions { UninstallPreviousVersionsOnUpdate = true }
+        );
+
+        var inner = Assert.Single(GetInnerOperations(operation, "PostOperations"));
+        var uninstall = Assert.IsType<UninstallPackageOperation>(inner.Operation);
+        Assert.Equal("2.0.0-rc1", uninstall.Package.VersionString);
+    }
+
+    // The mirror image, and the reason this had to be per-manager: on PyPI a bare trailing
+    // dash-number is an implicit POST-release, so "1.0.0-1" is NEWER than "1.0.0" and must
+    // never be queued for removal when updating onto it.
+    [Fact]
+    public async Task UpdateOperationLeavesANewerPostReleaseInstalledOnPip()
+    {
+        var manager = new Pip();
+        var package = new PackageBuilder()
+            .WithManager(manager)
+            .WithId("contoso-tool")
+            .WithVersion("0.9.0")
+            .WithNewVersion("1.0.0")
+            .Build();
+        InitializeLoaders();
+        await InstalledPackagesLoader.Instance.AddForeign(
+            new PackageBuilder()
+                .WithManager(manager)
+                .WithId("contoso-tool")
+                .WithVersion("1.0.0-1")
+                .Build()
+        );
+
+        using var operation = new UpdatePackageOperation(
+            package,
+            new InstallOptions { UninstallPreviousVersionsOnUpdate = true }
+        );
+
+        Assert.Empty(GetInnerOperations(operation, "PostOperations"));
+    }
+
+    // Pins pre-existing behaviour rather than endorsing it: when an installed version cannot be
+    // parsed at all, it is still treated as superseded and queued for removal. Left as-is
+    // deliberately - changing what a destructive operation does to unparseable input belongs in
+    // its own change, not in a version-comparison fix.
+    [Fact]
+    public async Task UpdateOperationStillQueuesAnUnparseableInstalledVersionForUninstall()
+    {
+        var manager = CreateManager();
+        var package = new PackageBuilder()
+            .WithManager(manager)
+            .WithId("Contoso.Tool")
+            .WithVersion("1.0.0")
+            .WithNewVersion("3.0.0")
+            .Build();
+        InitializeLoaders();
+        await InstalledPackagesLoader.Instance.AddForeign(
+            new PackageBuilder()
+                .WithManager(manager)
+                .WithId("Contoso.Tool")
+                .WithVersion("10c8e557")
+                .Build()
+        );
+
+        using var operation = new UpdatePackageOperation(
+            package,
+            new InstallOptions { UninstallPreviousVersionsOnUpdate = true }
+        );
+
+        var inner = Assert.Single(GetInnerOperations(operation, "PostOperations"));
+        var uninstall = Assert.IsType<UninstallPackageOperation>(inner.Operation);
+        Assert.Equal("10c8e557", uninstall.Package.VersionString);
+    }
+
+    [Fact]
+    public async Task UpdateOperationOnlyQueuesPreviousVersionsFromTheSameScope()
+    {
+        var manager = CreateManager();
+        var package = new PackageBuilder()
+            .WithManager(manager)
+            .WithId("Contoso.Tool")
+            .WithVersion("2.0.0")
+            .WithNewVersion("3.0.0")
+            .WithOptions(new OverridenInstallationOptions(PackageScope.User))
+            .Build();
+        InitializeLoaders();
+        await InstalledPackagesLoader.Instance.AddForeign(
+            new PackageBuilder()
+                .WithManager(manager)
+                .WithId("Contoso.Tool")
+                .WithVersion("1.0.0")
+                .WithOptions(new OverridenInstallationOptions(PackageScope.Machine))
+                .Build()
+        );
+        await InstalledPackagesLoader.Instance.AddForeign(
+            new PackageBuilder()
+                .WithManager(manager)
+                .WithId("Contoso.Tool")
+                .WithVersion("1.5.0")
+                .WithOptions(new OverridenInstallationOptions(PackageScope.User))
+                .Build()
+        );
+        await InstalledPackagesLoader.Instance.AddForeign(
+            new PackageBuilder()
+                .WithManager(manager)
+                .WithId("Contoso.Tool")
+                .WithVersion("1.7.0")
+                .Build()
+        );
+
+        using var operation = new UpdatePackageOperation(
+            package,
+            new InstallOptions { UninstallPreviousVersionsOnUpdate = true }
+        );
+
+        var uninstalled = GetInnerOperations(operation, "PostOperations")
+            .Select(inner => Assert.IsType<UninstallPackageOperation>(inner.Operation).Package.VersionString)
+            .Order()
+            .ToArray();
+        Assert.Equal(["1.5.0", "1.7.0"], uninstalled);
+    }
+
+    [Fact]
+    public async Task UpdateOperationQueuesPreviousVersionsFromTheScopeChosenForTheUpdate()
+    {
+        var manager = CreateManager();
+        var package = new PackageBuilder()
+            .WithManager(manager)
+            .WithId("Contoso.Tool")
+            .WithVersion("2.0.0")
+            .WithNewVersion("3.0.0")
+            .WithOptions(new OverridenInstallationOptions(PackageScope.User))
+            .Build();
+        InitializeLoaders();
+        await InstalledPackagesLoader.Instance.AddForeign(
+            new PackageBuilder()
+                .WithManager(manager)
+                .WithId("Contoso.Tool")
+                .WithVersion("1.0.0")
+                .WithOptions(new OverridenInstallationOptions(PackageScope.Machine))
+                .Build()
+        );
+        await InstalledPackagesLoader.Instance.AddForeign(
+            new PackageBuilder()
+                .WithManager(manager)
+                .WithId("Contoso.Tool")
+                .WithVersion("1.5.0")
+                .WithOptions(new OverridenInstallationOptions(PackageScope.User))
+                .Build()
+        );
+
+        using var operation = new UpdatePackageOperation(
+            package,
+            new InstallOptions
+            {
+                UninstallPreviousVersionsOnUpdate = true,
+                InstallationScope = PackageScope.Machine,
+            }
+        );
+
+        var inner = Assert.Single(GetInnerOperations(operation, "PostOperations"));
+        var uninstall = Assert.IsType<UninstallPackageOperation>(inner.Operation);
+        Assert.Equal("1.0.0", uninstall.Package.VersionString);
+    }
+
+    [Fact]
+    public async Task UpdateOperationWithoutAScopeQueuesPreviousVersionsFromEveryScope()
+    {
+        var manager = CreateManager();
+        var package = new PackageBuilder()
+            .WithManager(manager)
+            .WithId("Contoso.Tool")
+            .WithVersion("2.0.0")
+            .WithNewVersion("3.0.0")
+            .Build();
+        InitializeLoaders();
+        await InstalledPackagesLoader.Instance.AddForeign(
+            new PackageBuilder()
+                .WithManager(manager)
+                .WithId("Contoso.Tool")
+                .WithVersion("1.0.0")
+                .WithOptions(new OverridenInstallationOptions(PackageScope.Machine))
+                .Build()
+        );
+        await InstalledPackagesLoader.Instance.AddForeign(
+            new PackageBuilder()
+                .WithManager(manager)
+                .WithId("Contoso.Tool")
+                .WithVersion("1.5.0")
+                .WithOptions(new OverridenInstallationOptions(PackageScope.User))
+                .Build()
+        );
+
+        using var operation = new UpdatePackageOperation(
+            package,
+            new InstallOptions { UninstallPreviousVersionsOnUpdate = true }
+        );
+
+        var uninstalled = GetInnerOperations(operation, "PostOperations")
+            .Select(inner => Assert.IsType<UninstallPackageOperation>(inner.Operation).Package.VersionString)
+            .Order()
+            .ToArray();
+        Assert.Equal(["1.0.0", "1.5.0"], uninstalled);
     }
 
     [Fact]
@@ -265,6 +499,301 @@ public sealed class PackageOperationsTests
         Assert.True(badges.Interactive);
         Assert.True(badges.SkipHashCheck);
         Assert.Equal(PackageScope.Machine, badges.Scope);
+    }
+
+    private static TestPackageManager CreateSlowProcessManager(bool serializesOperations)
+    {
+        return new PackageManagerBuilder()
+            .WithName($"SlowManager{Guid.NewGuid():N}")
+            .ConfigureCapabilities(capabilities =>
+            {
+                capabilities.SerializesOperations = serializesOperations;
+                return capabilities;
+            })
+            .ConfigureManager(manager =>
+            {
+                manager.ExecutablePath = Path.Join(Environment.SystemDirectory, "cmd.exe");
+                manager.ExecutableArguments = "/c";
+            })
+            .ConfigureOperation(helper =>
+            {
+                helper.ParametersFactory = (_, _, _) => ["ping", "-n", "3", "127.0.0.1"];
+                helper.ResultFactory = (_, _, _, _) => OperationVeredict.Success;
+            })
+            .Build();
+    }
+
+    private static bool HasLine(AbstractOperation operation, string prefix) =>
+        operation.GetOutput().Any(line => line.Item1.StartsWith(prefix, StringComparison.Ordinal));
+
+    private static async Task WaitForConditionAsync(Func<bool> condition)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        while (!condition())
+            await Task.Delay(25, timeout.Token);
+    }
+
+    private static Func<bool> ReportsWaitingOnTheGate(AbstractOperation operation)
+    {
+        bool reported = false;
+        operation.LogLineAdded += (_, line) =>
+        {
+            if (line.Item1.StartsWith("Waiting for another", StringComparison.Ordinal))
+                reported = true;
+        };
+        return () => reported;
+    }
+
+    [Fact]
+    public async Task ASuccessfulOperationInvalidatesTheInstalledPackagesOfItsManager()
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+
+        var manager = CreateSlowProcessManager(serializesOperations: false);
+        InitializeLoaders();
+        long generationBefore = manager.InstalledPackagesGeneration;
+        using var operation = new UpdatePackageOperation(
+            new PackageBuilder().WithManager(manager).WithId("updated").Build(),
+            new InstallOptions(),
+            IgnoreParallelInstalls: true
+        );
+
+        await operation.MainThread().WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.Equal(OperationStatus.Succeeded, operation.Status);
+        Assert.NotEqual(generationBefore, manager.InstalledPackagesGeneration);
+    }
+
+    [Fact]
+    public async Task OperationsOfASerializingManagerNeverRunTheirProcessesConcurrently()
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+
+        var manager = CreateSlowProcessManager(serializesOperations: true);
+        InitializeLoaders();
+        using var first = new InstallPackageOperation(
+            new PackageBuilder().WithManager(manager).WithId("first").Build(),
+            new InstallOptions(),
+            IgnoreParallelInstalls: true
+        );
+        using var second = new InstallPackageOperation(
+            new PackageBuilder().WithManager(manager).WithId("second").Build(),
+            new InstallOptions(),
+            IgnoreParallelInstalls: true
+        );
+        var secondWaited = ReportsWaitingOnTheGate(second);
+        bool? firstFinishedWhenSecondStarted = null;
+        second.LogLineAdded += (_, line) =>
+        {
+            if (line.Item1.StartsWith("Executing process", StringComparison.Ordinal))
+                firstFinishedWhenSecondStarted = HasLine(first, "Process return value");
+        };
+
+        Task firstRun = first.MainThread();
+        await WaitForConditionAsync(() => HasLine(first, "Start Time"));
+        Task secondRun = second.MainThread();
+        await Task.WhenAll(firstRun, secondRun).WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.Equal(OperationStatus.Succeeded, first.Status);
+        Assert.Equal(OperationStatus.Succeeded, second.Status);
+        Assert.True(firstFinishedWhenSecondStarted);
+        Assert.True(secondWaited());
+    }
+
+    [Fact]
+    public async Task OperationsOfANonSerializingManagerRunTheirProcessesConcurrently()
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+
+        var manager = CreateSlowProcessManager(serializesOperations: false);
+        InitializeLoaders();
+        using var first = new InstallPackageOperation(
+            new PackageBuilder().WithManager(manager).WithId("first").Build(),
+            new InstallOptions(),
+            IgnoreParallelInstalls: true
+        );
+        using var second = new InstallPackageOperation(
+            new PackageBuilder().WithManager(manager).WithId("second").Build(),
+            new InstallOptions(),
+            IgnoreParallelInstalls: true
+        );
+        var secondWaited = ReportsWaitingOnTheGate(second);
+        bool? firstFinishedWhenSecondStarted = null;
+        second.LogLineAdded += (_, line) =>
+        {
+            if (line.Item1.StartsWith("Executing process", StringComparison.Ordinal))
+                firstFinishedWhenSecondStarted = HasLine(first, "Process return value");
+        };
+
+        Task firstRun = first.MainThread();
+        await WaitForConditionAsync(() => HasLine(first, "Start Time"));
+        Task secondRun = second.MainThread();
+        await Task.WhenAll(firstRun, secondRun).WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.False(firstFinishedWhenSecondStarted);
+        Assert.False(secondWaited());
+    }
+
+    [Fact]
+    public async Task CancelingAnOperationWaitingOnASerializingManagerLeavesTheGateUsable()
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+
+        var manager = CreateSlowProcessManager(serializesOperations: true);
+        InitializeLoaders();
+        using var first = new InstallPackageOperation(
+            new PackageBuilder().WithManager(manager).WithId("first").Build(),
+            new InstallOptions(),
+            IgnoreParallelInstalls: true
+        );
+        using var waiting = new InstallPackageOperation(
+            new PackageBuilder().WithManager(manager).WithId("waiting").Build(),
+            new InstallOptions(),
+            IgnoreParallelInstalls: true
+        );
+        using var third = new InstallPackageOperation(
+            new PackageBuilder().WithManager(manager).WithId("third").Build(),
+            new InstallOptions(),
+            IgnoreParallelInstalls: true
+        );
+        var waitingReported = ReportsWaitingOnTheGate(waiting);
+        var thirdWaited = ReportsWaitingOnTheGate(third);
+
+        Task firstRun = first.MainThread();
+        await WaitForConditionAsync(() => HasLine(first, "Start Time"));
+        Task waitingRun = waiting.MainThread();
+        await WaitForConditionAsync(waitingReported);
+        waiting.Cancel();
+        await waitingRun.WaitAsync(TimeSpan.FromSeconds(10));
+        await firstRun.WaitAsync(TimeSpan.FromSeconds(30));
+        await third.MainThread().WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.Equal(OperationStatus.Canceled, waiting.Status);
+        Assert.False(HasLine(waiting, "Executing process"));
+        Assert.DoesNotContain(
+            waiting.GetOutput(),
+            line => line.Item1.Contains("CanceledException", StringComparison.Ordinal)
+        );
+        Assert.Equal(OperationStatus.Succeeded, first.Status);
+        Assert.Equal(OperationStatus.Succeeded, third.Status);
+        Assert.False(thirdWaited());
+    }
+
+    [Fact]
+    public async Task AnOperationWaitingOnASerializingManagerDoesNotHoldAParallelSlot()
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+
+        var serialized = CreateSlowProcessManager(serializesOperations: true);
+        var other = CreateSlowProcessManager(serializesOperations: false);
+        InitializeLoaders();
+        using var first = new InstallPackageOperation(
+            new PackageBuilder().WithManager(serialized).WithId("first").Build(),
+            new InstallOptions()
+        );
+        using var waiting = new InstallPackageOperation(
+            new PackageBuilder().WithManager(serialized).WithId("waiting").Build(),
+            new InstallOptions()
+        );
+        using var unrelated = new InstallPackageOperation(
+            new PackageBuilder().WithManager(other).WithId("unrelated").Build(),
+            new InstallOptions()
+        );
+        var waitingReported = ReportsWaitingOnTheGate(waiting);
+        bool? firstFinishedWhenUnrelatedStarted = null;
+        unrelated.LogLineAdded += (_, line) =>
+        {
+            if (line.Item1.StartsWith("Executing process", StringComparison.Ordinal))
+                firstFinishedWhenUnrelatedStarted = HasLine(first, "Process return value");
+        };
+
+        AbstractOperation.OperationQueue.Clear();
+        int previousMax = AbstractOperation.MAX_OPERATIONS;
+        AbstractOperation.MAX_OPERATIONS = 2;
+        try
+        {
+            Task firstRun = first.MainThread();
+            await WaitForConditionAsync(() => HasLine(first, "Start Time"));
+            Task waitingRun = waiting.MainThread();
+            await WaitForConditionAsync(waitingReported);
+            Task unrelatedRun = unrelated.MainThread();
+            await Task.WhenAll(firstRun, waitingRun, unrelatedRun).WaitAsync(TimeSpan.FromSeconds(30));
+        }
+        finally
+        {
+            AbstractOperation.MAX_OPERATIONS = previousMax;
+            AbstractOperation.OperationQueue.Clear();
+        }
+
+        Assert.Equal(OperationStatus.Succeeded, first.Status);
+        Assert.Equal(OperationStatus.Succeeded, waiting.Status);
+        Assert.Equal(OperationStatus.Succeeded, unrelated.Status);
+        Assert.False(firstFinishedWhenUnrelatedStarted);
+    }
+
+    private static TestPackageManager CreateFailingEchoManager(params string[] echoed)
+    {
+        return new PackageManagerBuilder()
+            .WithName($"FailingManager{Guid.NewGuid():N}")
+            .ConfigureManager(manager =>
+            {
+                manager.ExecutablePath = Path.Join(Environment.SystemDirectory, "cmd.exe");
+                manager.ExecutableArguments = "/c";
+            })
+            .ConfigureOperation(helper =>
+            {
+                helper.ParametersFactory = (_, _, _) => ["echo", .. echoed];
+                helper.ResultFactory = (_, _, _, _) => OperationVeredict.Failure;
+            })
+            .Build();
+    }
+
+    [Fact]
+    public async Task AFailureCausedByAFileInUseTellsTheUserToCloseTheProgramUsingIt()
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+
+        var manager = CreateFailingEchoManager("ERROR:", "[WinError", "32]", "file", "busy");
+        InitializeLoaders();
+        using var operation = new UpdatePackageOperation(
+            new PackageBuilder().WithManager(manager).WithId("botocore").WithName("botocore").Build(),
+            new InstallOptions(),
+            IgnoreParallelInstalls: true
+        );
+
+        await operation.MainThread().WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.Equal(OperationStatus.Failed, operation.Status);
+        Assert.Equal(
+            "A file of botocore is in use by another program. Close any program that may be using it, then try again",
+            operation.Metadata.FailureMessage
+        );
+    }
+
+    [Fact]
+    public async Task AFailureWithoutAFileInUseKeepsTheGenericFailureMessage()
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+
+        var manager = CreateFailingEchoManager("ERROR:", "[WinError", "5]", "denied");
+        InitializeLoaders();
+        using var operation = new UpdatePackageOperation(
+            new PackageBuilder().WithManager(manager).WithId("botocore").WithName("botocore").Build(),
+            new InstallOptions(),
+            IgnoreParallelInstalls: true
+        );
+
+        await operation.MainThread().WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.Equal(OperationStatus.Failed, operation.Status);
+        Assert.DoesNotContain("in use by another program", operation.Metadata.FailureMessage);
     }
 
     [Fact]
@@ -435,6 +964,50 @@ public sealed class PackageOperationsTests
     }
 
     [Fact]
+    public async Task UpdateOperationSuccessfulRunIgnoresAnInstallOnlyPinnedVersion()
+    {
+        TestPackageManager? manager = null;
+        Package? installedPackage = null;
+        manager = new PackageManagerBuilder()
+            .ConfigureCapabilities(capabilities =>
+            {
+                capabilities.SupportsCustomVersionsOnUpdate = false;
+                return capabilities;
+            })
+            .WithInstalledPackages(_ => [Assert.IsType<Package>(installedPackage)])
+            .Build();
+        var installedBeforeUpdate = new PackageBuilder()
+            .WithManager(manager)
+            .WithId("jq")
+            .WithVersion("1.7.1")
+            .WithNewVersion("1.8.2")
+            .Build();
+        installedPackage = new PackageBuilder()
+            .WithManager(manager)
+            .WithId("jq")
+            .WithVersion("1.8.2")
+            .Build();
+        InitializeLoaders();
+        await InstalledPackagesLoader.Instance.AddForeign(installedBeforeUpdate);
+        using var operation = new SimulatedUpdatePackageOperation(
+            installedBeforeUpdate,
+            new InstallOptions { Version = "1.7.1" },
+            OperationVeredict.Success
+        );
+
+        await operation.MainThread();
+        await WaitForAsync(() =>
+            InstalledPackagesLoader.Instance.GetEquivalentPackages(installedBeforeUpdate)
+                .Any(package => package.VersionString == "1.8.2")
+        );
+
+        Assert.DoesNotContain(
+            InstalledPackagesLoader.Instance.GetEquivalentPackages(installedBeforeUpdate),
+            package => package.VersionString == "1.7.1"
+        );
+    }
+
+    [Fact]
     public async Task OutputSnapshotsDoNotThrowWhileLinesAreAppended()
     {
         using var operation = new LoggingStubOperation();
@@ -504,6 +1077,166 @@ public sealed class PackageOperationsTests
         await mainThread;
 
         Assert.Equal(OperationStatus.Canceled, operation.Status);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task HeldOperationsDoNotStartUntilTheHoldIsReleased(bool queueEnabled)
+    {
+        using var operation = new CancellationAwareStubOperation(queueEnabled);
+        Task mainThread;
+        AbstractOperation.HoldNewOperations = true;
+        try
+        {
+            mainThread = operation.MainThread();
+            await Task.Delay(300);
+
+            Assert.False(operation.PerformStarted.Task.IsCompleted);
+            Assert.Equal(OperationStatus.InQueue, operation.Status);
+        }
+        finally
+        {
+            AbstractOperation.HoldNewOperations = false;
+        }
+
+        await operation.PerformStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        operation.Cancel();
+        await operation.CancellationObserved.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        operation.AllowCleanupToComplete.TrySetResult(true);
+        await mainThread;
+    }
+
+    [Fact]
+    public async Task TheHoldIsRefusedWhileAnOperationIsExecuting()
+    {
+        using var operation = new CancellationAwareStubOperation();
+        Task mainThread = operation.MainThread();
+        await operation.PerformStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+
+        Assert.False(AbstractOperation.TryHoldNewOperations());
+
+        operation.Cancel();
+        await operation.CancellationObserved.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        operation.AllowCleanupToComplete.TrySetResult(true);
+        await mainThread;
+
+        Assert.True(AbstractOperation.TryHoldNewOperations());
+        AbstractOperation.HoldNewOperations = false;
+    }
+
+    [Fact]
+    public void AdmittedWorkAndTheHoldExcludeEachOther()
+    {
+        Assert.True(AbstractOperation.TryBeginWork());
+        try
+        {
+            Assert.False(AbstractOperation.TryHoldNewOperations());
+        }
+        finally
+        {
+            AbstractOperation.EndWork();
+        }
+
+        Assert.True(AbstractOperation.TryHoldNewOperations());
+        try
+        {
+            Assert.False(AbstractOperation.TryBeginWork());
+        }
+        finally
+        {
+            AbstractOperation.HoldNewOperations = false;
+        }
+    }
+
+    [Fact]
+    public async Task ARetryWaitsWhileNewOperationsAreHeld()
+    {
+        using var operation = new RetryAwareStubOperation();
+        Task firstRun = operation.MainThread();
+        await operation.FirstRunStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+
+        operation.Cancel();
+        await operation.CancellationObserved.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        operation.Retry(AbstractOperation.RetryMode.Retry);
+
+        AbstractOperation.HoldNewOperations = true;
+        try
+        {
+            operation.AllowCleanupToComplete.TrySetResult(true);
+            await firstRun;
+            await Task.Delay(300);
+
+            Assert.False(operation.SecondRunStarted.Task.IsCompleted);
+        }
+        finally
+        {
+            AbstractOperation.HoldNewOperations = false;
+        }
+
+        await operation.SecondRunStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await WaitForAsync(() => operation.Status is OperationStatus.Succeeded);
+    }
+
+    [Fact]
+    public async Task NoWorkIsAdmittedOnceTheHoldIsTaken()
+    {
+        int overlaps = 0;
+        using var stop = new CancellationTokenSource();
+        Task[] workers = Enumerable.Range(0, 8).Select(_ => Task.Run(() =>
+        {
+            while (!stop.IsCancellationRequested)
+            {
+                if (!AbstractOperation.TryBeginWork())
+                    continue;
+                Thread.SpinWait(200);
+                if (AbstractOperation.HoldNewOperations)
+                    Interlocked.Increment(ref overlaps);
+                AbstractOperation.EndWork();
+            }
+        })).ToArray();
+
+        try
+        {
+            for (int i = 0; i < 2000; i++)
+            {
+                if (!AbstractOperation.TryHoldNewOperations())
+                    continue;
+                Thread.SpinWait(200);
+                AbstractOperation.HoldNewOperations = false;
+            }
+        }
+        finally
+        {
+            stop.Cancel();
+            await Task.WhenAll(workers);
+            AbstractOperation.HoldNewOperations = false;
+        }
+
+        Assert.Equal(0, overlaps);
+    }
+
+    [Fact]
+    public async Task CancelingAHeldOperationEndsItWithoutRunning()
+    {
+        using var operation = new CancellationAwareStubOperation(queueEnabled: true);
+        AbstractOperation.HoldNewOperations = true;
+        try
+        {
+            Task mainThread = operation.MainThread();
+            await Task.Delay(300);
+
+            operation.Cancel();
+            await mainThread.WaitAsync(TimeSpan.FromSeconds(2));
+
+            Assert.False(operation.PerformStarted.Task.IsCompleted);
+            Assert.Equal(OperationStatus.Canceled, operation.Status);
+            Assert.Equal(0, AbstractOperation.QueueLength());
+        }
+        finally
+        {
+            AbstractOperation.HoldNewOperations = false;
+        }
     }
 
     [Fact]
@@ -644,12 +1377,275 @@ public sealed class PackageOperationsTests
         await firstRun;
     }
 
+    [Theory]
+    [InlineData(1)]
+    [InlineData(3)]
+    public async Task UserRequestedOperationsQueueAheadOfBackgroundOnes(int parallelOperations)
+    {
+        var running = new List<CancellationAwareStubOperation>();
+        var runningTasks = new List<Task>();
+        for (int i = 0; i < parallelOperations; i++)
+            running.Add(new CancellationAwareStubOperation(queueEnabled: true) { IsBackgroundOperation = true });
+
+        using var firstBackground = new CancellationAwareStubOperation(queueEnabled: true)
+        {
+            IsBackgroundOperation = true,
+        };
+        using var secondBackground = new CancellationAwareStubOperation(queueEnabled: true)
+        {
+            IsBackgroundOperation = true,
+        };
+        using var userRequested = new CancellationAwareStubOperation(queueEnabled: true);
+
+        AbstractOperation.OperationQueue.Clear();
+        int previousMax = AbstractOperation.MAX_OPERATIONS;
+        AbstractOperation.MAX_OPERATIONS = parallelOperations;
+
+        try
+        {
+            foreach (var blocker in running)
+            {
+                runningTasks.Add(blocker.MainThread());
+                await blocker.PerformStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+            }
+
+            _ = firstBackground.MainThread();
+            await WaitUntilQueued(firstBackground);
+            _ = secondBackground.MainThread();
+            await WaitUntilQueued(secondBackground);
+            _ = userRequested.MainThread();
+            await WaitUntilQueued(userRequested);
+
+            var expected = new List<AbstractOperation>(running)
+            {
+                userRequested,
+                firstBackground,
+                secondBackground,
+            };
+            Assert.Equal(expected, AbstractOperation.OperationQueue);
+
+            firstBackground.Cancel();
+            secondBackground.Cancel();
+            userRequested.Cancel();
+
+            foreach (var blocker in running)
+            {
+                blocker.Cancel();
+                await blocker.CancellationObserved.Task.WaitAsync(TimeSpan.FromSeconds(1));
+                blocker.AllowCleanupToComplete.TrySetResult(true);
+            }
+
+            await Task.WhenAll(runningTasks);
+        }
+        finally
+        {
+            foreach (var blocker in running)
+                blocker.Dispose();
+            AbstractOperation.MAX_OPERATIONS = previousMax;
+            AbstractOperation.OperationQueue.Clear();
+        }
+    }
+
+    [Fact]
+    public async Task AUserRequestedOperationDoesNotOvertakeEarlierUserRequestedOnes()
+    {
+        using var running = new CancellationAwareStubOperation(queueEnabled: true)
+        {
+            IsBackgroundOperation = true,
+        };
+        using var firstUser = new CancellationAwareStubOperation(queueEnabled: true);
+        using var secondUser = new CancellationAwareStubOperation(queueEnabled: true);
+        using var promotedBackground = new CancellationAwareStubOperation(queueEnabled: true)
+        {
+            IsBackgroundOperation = true,
+        };
+        using var lateUser = new CancellationAwareStubOperation(queueEnabled: true);
+
+        AbstractOperation.OperationQueue.Clear();
+        int previousMax = AbstractOperation.MAX_OPERATIONS;
+        AbstractOperation.MAX_OPERATIONS = 1;
+
+        try
+        {
+            Task runningTask = running.MainThread();
+            await running.PerformStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+
+            _ = firstUser.MainThread();
+            await WaitUntilQueued(firstUser);
+            _ = secondUser.MainThread();
+            await WaitUntilQueued(secondUser);
+            _ = promotedBackground.MainThread();
+            await WaitUntilQueued(promotedBackground);
+
+            promotedBackground.RunNext();
+
+            _ = lateUser.MainThread();
+            await WaitUntilQueued(lateUser);
+
+            Assert.Equal(
+                new AbstractOperation[]
+                {
+                    running,
+                    promotedBackground,
+                    firstUser,
+                    secondUser,
+                    lateUser,
+                },
+                AbstractOperation.OperationQueue
+            );
+
+            firstUser.Cancel();
+            secondUser.Cancel();
+            promotedBackground.Cancel();
+            lateUser.Cancel();
+
+            running.Cancel();
+            await running.CancellationObserved.Task.WaitAsync(TimeSpan.FromSeconds(1));
+            running.AllowCleanupToComplete.TrySetResult(true);
+            await runningTask;
+        }
+        finally
+        {
+            AbstractOperation.MAX_OPERATIONS = previousMax;
+            AbstractOperation.OperationQueue.Clear();
+        }
+    }
+
+    [Fact]
+    public void ReorderingAnOperationThatLeftTheQueueDoesNotPutItBack()
+    {
+        using var runNext = new CancellationAwareStubOperation(queueEnabled: true);
+        using var backOfQueue = new CancellationAwareStubOperation(queueEnabled: true);
+
+        AbstractOperation.OperationQueue.Clear();
+
+        try
+        {
+            Assert.Equal(OperationStatus.InQueue, runNext.Status);
+            Assert.Equal(OperationStatus.InQueue, backOfQueue.Status);
+
+            runNext.RunNext();
+            backOfQueue.BackOfTheQueue();
+
+            Assert.Empty(AbstractOperation.OperationQueue);
+        }
+        finally
+        {
+            AbstractOperation.OperationQueue.Clear();
+        }
+    }
+
+    [Fact]
+    public void RetryingABackgroundOperationMakesItUserRequested()
+    {
+        using var operation = new CancellationAwareStubOperation(queueEnabled: true)
+        {
+            IsBackgroundOperation = true,
+        };
+
+        operation.Retry(AbstractOperation.RetryMode.Retry);
+
+        Assert.False(operation.IsBackgroundOperation);
+    }
+
+    [Fact]
+    public async Task APromotedBackgroundOperationKeepsItsSlotWhenNoUserOperationIsQueued()
+    {
+        using var running = new CancellationAwareStubOperation(queueEnabled: true)
+        {
+            IsBackgroundOperation = true,
+        };
+        using var untouchedBackground = new CancellationAwareStubOperation(queueEnabled: true)
+        {
+            IsBackgroundOperation = true,
+        };
+        using var promotedBackground = new CancellationAwareStubOperation(queueEnabled: true)
+        {
+            IsBackgroundOperation = true,
+        };
+        using var lateUser = new CancellationAwareStubOperation(queueEnabled: true);
+
+        AbstractOperation.OperationQueue.Clear();
+        int previousMax = AbstractOperation.MAX_OPERATIONS;
+        AbstractOperation.MAX_OPERATIONS = 1;
+
+        try
+        {
+            Task runningTask = running.MainThread();
+            await running.PerformStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+
+            _ = untouchedBackground.MainThread();
+            await WaitUntilQueued(untouchedBackground);
+            _ = promotedBackground.MainThread();
+            await WaitUntilQueued(promotedBackground);
+
+            promotedBackground.RunNext();
+
+            _ = lateUser.MainThread();
+            await WaitUntilQueued(lateUser);
+
+            Assert.Equal(
+                new AbstractOperation[]
+                {
+                    running,
+                    promotedBackground,
+                    lateUser,
+                    untouchedBackground,
+                },
+                AbstractOperation.OperationQueue
+            );
+
+            untouchedBackground.Cancel();
+            promotedBackground.Cancel();
+            lateUser.Cancel();
+
+            running.Cancel();
+            await running.CancellationObserved.Task.WaitAsync(TimeSpan.FromSeconds(1));
+            running.AllowCleanupToComplete.TrySetResult(true);
+            await runningTask;
+        }
+        finally
+        {
+            AbstractOperation.MAX_OPERATIONS = previousMax;
+            AbstractOperation.OperationQueue.Clear();
+        }
+    }
+
+    private static async Task WaitUntilQueued(AbstractOperation operation)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(1);
+        while (!AbstractOperation.OperationQueue.Contains(operation))
+        {
+            if (DateTime.UtcNow > deadline)
+                throw new TimeoutException("The operation never reached the queue");
+            await Task.Delay(10);
+        }
+    }
+
     [Fact]
     public async Task BrokerOperationFailsWithoutLocalFallbackWhenProbeFails()
     {
         var transport = new FakeBrokerTransport(healthy: false);
 
         await AssertBrokerUnavailableFailure(transport);
+    }
+
+    [Theory]
+    [InlineData(BrokerUnreachableCause.NotListening, "The Devolutions Agent package broker is not running")]
+    [InlineData(BrokerUnreachableCause.ConnectionClosed, "Devolutions Agent refused this copy of UniGetUI")]
+    [InlineData(BrokerUnreachableCause.Unknown, "Agent broker unavailable")]
+    public async Task BrokerOperationExplainsWhyTheBrokerIsUnreachable(BrokerUnreachableCause cause, string expectedTitle)
+    {
+        var transport = new FakeBrokerTransport(healthy: false);
+        PackageOperation.BrokerUnreachableDiagnosis = _ => Task.FromResult(cause);
+        try
+        {
+            await AssertBrokerUnavailableFailure(transport, expectedTitle);
+        }
+        finally
+        {
+            PackageOperation.BrokerUnreachableDiagnosis = null;
+        }
     }
 
     [Fact]
@@ -664,13 +1660,121 @@ public sealed class PackageOperationsTests
         Assert.Contains(transport.RequestedPaths, path => path != "/v1/health");
     }
 
+    private static async Task<(OperationVeredict Veredict, string? Title, string? Message)> RunBrokeredOperationCapturingFailure(
+        ScriptedBrokerTransport transport,
+        string? packageId = null)
+    {
+        AbstractOperation? created = null;
+        var result = await RunBrokeredOperationWithOutput(
+            transport,
+            onOperationCreated: operation => created = operation,
+            packageId: packageId);
+        return (result.Veredict, created?.Metadata.FailureTitle, created?.Metadata.FailureMessage);
+    }
+
+    [Fact]
+    public async Task BrokerPolicyDenialExplainsTheReasonAndRule()
+    {
+        var transport = new ScriptedBrokerTransport
+        {
+            Denial = new BrokerApiDecisionInfo
+            {
+                Decision = BrokerApiDecision.Deny,
+                RuleId = "deny-old-versions",
+                Reason = "Versions before 2.0 are not allowed",
+            },
+        };
+
+        var (veredict, title, message) = await RunBrokeredOperationCapturingFailure(transport);
+
+        Assert.Equal(OperationVeredict.Failure, veredict);
+        Assert.Equal(CoreTools.Translate("Operation denied by policy"), title);
+        Assert.Contains("deny-old-versions", message);
+        Assert.Contains("Versions before 2.0 are not allowed", message);
+    }
+
+    [Theory]
+    [InlineData(401, BrokerApiErrorCode.Unauthorized)]
+    [InlineData(403, BrokerApiErrorCode.Forbidden)]
+    public async Task BrokerRefusingTheCapabilitiesRequestIsReportedAsAnAuthorizationFailure(
+        int statusCode,
+        BrokerApiErrorCode code)
+    {
+        bool originalSetting = Settings.Get(Settings.K.UseAgentBroker);
+        BrokerFailureDescription? notified = null;
+        EventHandler<BrokerFailureDescription> onBrokerUnavailable = (_, failure) => notified = failure;
+        PackageOperation.BrokerUnavailable += onBrokerUnavailable;
+        try
+        {
+            var transport = new ScriptedBrokerTransport
+            {
+                CapabilitiesError = (statusCode, code),
+            };
+
+            var (veredict, title, message) = await RunBrokeredOperationCapturingFailure(transport);
+
+            Assert.Equal(OperationVeredict.Failure, veredict);
+            Assert.Equal(CoreTools.Translate("UniGetUI is not authorized to use the Devolutions Agent"), title);
+            Assert.Contains("signed", message);
+            Assert.Equal(title, notified?.Title);
+            Assert.Equal(message, notified?.Message);
+            Assert.DoesNotContain("/v1/package-operations/execute", transport.RequestedPaths);
+        }
+        finally
+        {
+            PackageOperation.BrokerUnavailable -= onBrokerUnavailable;
+            Settings.Set(Settings.K.UseAgentBroker, originalSetting);
+        }
+    }
+
+    [Fact]
+    public async Task BrokerPausedWithoutPolicyIsExplained()
+    {
+        var transport = new ScriptedBrokerTransport
+        {
+            CapabilitiesError = (503, BrokerApiErrorCode.BrokerPaused),
+        };
+
+        var (veredict, title, _) = await RunBrokeredOperationCapturingFailure(transport);
+
+        Assert.Equal(OperationVeredict.Failure, veredict);
+        Assert.Equal(CoreTools.Translate("Package operations are paused"), title);
+    }
+
+    [Fact]
+    public async Task BrokerRequestThatTheBrokerWouldRejectIsNotSent()
+    {
+        var transport = new ScriptedBrokerTransport();
+
+        var (veredict, title, message) = await RunBrokeredOperationCapturingFailure(transport, packageId: "git;7zip");
+
+        Assert.Equal(OperationVeredict.Failure, veredict);
+        Assert.Equal(CoreTools.Translate("The package broker cannot accept this request"), title);
+        Assert.Contains("git;7zip", message);
+        Assert.DoesNotContain("/v1/package-operations/execute", transport.RequestedPaths);
+    }
+
+    [Fact]
+    public async Task BrokeredInstallSendsTheResolvedPackageVersion()
+    {
+        var transport = new ScriptedBrokerTransport();
+
+        await RunBrokeredOperation(transport);
+
+        Assert.NotNull(transport.LastExecuteRequestBody);
+        var request = BrokerSerializer.Deserialize<BrokerApiPackageRequest>(transport.LastExecuteRequestBody!);
+        Assert.Equal("1.0.0", request!.Package.Version);
+    }
+
     /// <summary>
     /// Runs an install operation against a broker whose transport simulates an outage and
     /// asserts the policy-enforcement contract: the operation fails with the
     /// broker-unavailable metadata, raises <see cref="PackageOperation.BrokerUnavailable"/>,
     /// and never falls back to local process execution.
     /// </summary>
-    private static async Task AssertBrokerUnavailableFailure(FakeBrokerTransport transport)
+    private static async Task AssertBrokerUnavailableFailure(
+        FakeBrokerTransport transport,
+        string expectedTitle = "Agent broker unavailable")
     {
         bool originalSetting = Settings.Get(Settings.K.UseAgentBroker);
         bool localExecutionPrepared = false;
@@ -690,7 +1794,12 @@ public sealed class PackageOperationsTests
             .Build();
         var package = new PackageBuilder().WithManager(manager).Build();
         string? notifiedMessage = null;
-        EventHandler<string> onBrokerUnavailable = (_, message) => notifiedMessage = message;
+        string? notifiedTitle = null;
+        EventHandler<BrokerFailureDescription> onBrokerUnavailable = (_, failure) =>
+        {
+            notifiedTitle = failure.Title;
+            notifiedMessage = failure.Message;
+        };
         PackageOperation.BrokerUnavailable += onBrokerUnavailable;
         PackageOperation.BrokerTransportFactory = () => transport;
         Settings.Set(Settings.K.UseAgentBroker, true);
@@ -701,9 +1810,10 @@ public sealed class PackageOperationsTests
 
             Assert.Equal(OperationVeredict.Failure, veredict);
             Assert.Equal(
-                CoreTools.Translate("Agent broker unavailable"),
+                CoreTools.Translate(expectedTitle),
                 operation.Metadata.FailureTitle);
             Assert.False(string.IsNullOrWhiteSpace(operation.Metadata.FailureMessage));
+            Assert.Equal(operation.Metadata.FailureTitle, notifiedTitle);
             Assert.Equal(operation.Metadata.FailureMessage, notifiedMessage);
             Assert.False(localExecutionPrepared);
         }
@@ -744,7 +1854,8 @@ public sealed class PackageOperationsTests
         Action<CancellationTokenSource>? configureCancellation = null,
         Action<TestPackageOperationHelper>? configureOperationHelper = null,
         Action<AbstractOperation>? onOperationCreated = null,
-        TimeSpan? operationTimeout = null)
+        TimeSpan? operationTimeout = null,
+        string? packageId = null)
     {
         bool originalSetting = Settings.Get(Settings.K.UseAgentBroker);
         int originalPollInterval = PackageOperation.BrokerStatusPollIntervalMs;
@@ -760,7 +1871,7 @@ public sealed class PackageOperationsTests
             })
             .ConfigureOperation(helper => configureOperationHelper?.Invoke(helper))
             .Build();
-        var package = new PackageBuilder().WithManager(manager).Build();
+        var package = new PackageBuilder().WithManager(manager).WithId(packageId ?? "Contoso.Test").Build();
         PackageOperation.BrokerTransportFactory = () => transport;
         PackageOperation.BrokerStatusPollIntervalMs = 5;
         PackageOperation.BrokerCancelRequestTimeout = TimeSpan.FromSeconds(2);
@@ -893,6 +2004,26 @@ public sealed class PackageOperationsTests
     }
 
     [Fact]
+    public async Task BrokeredOperationAppliesTheManagerOperationOverrides()
+    {
+        var transport = new ScriptedBrokerTransport
+        {
+            StatusAfterCancel = BrokerApiOperationStatus.Completed,
+            CompletedExitCode = 0,
+        };
+
+        var result = await RunBrokeredOperationWithOutput(
+            transport,
+            configureOperationHelper: helper => helper.OperationOverridesAction =
+                (_, options, _) => options.Architecture = Architecture.x64);
+
+        Assert.Equal(OperationVeredict.Success, result.Veredict);
+        Assert.Equal(
+            BrokerApiArchitecture.X64,
+            DeserializeExecuteRequest(transport).Package.Architecture);
+    }
+
+    [Fact]
     public async Task BrokeredOperationRequestsStandardElevationByDefault()
     {
         var transport = new ScriptedBrokerTransport
@@ -942,7 +2073,7 @@ public sealed class PackageOperationsTests
     private static BrokerApiPackageRequest DeserializeExecuteRequest(ScriptedBrokerTransport transport)
     {
         Assert.NotNull(transport.LastExecuteRequestBody);
-        var request = BrokerJson.Deserialize<BrokerApiPackageRequest>(transport.LastExecuteRequestBody);
+        var request = BrokerSerializer.Deserialize<BrokerApiPackageRequest>(transport.LastExecuteRequestBody);
         Assert.NotNull(request);
         return request;
     }
@@ -1204,7 +2335,7 @@ public sealed class PackageOperationsTests
     /// <summary>
     /// A scriptable broker transport implementing the full happy-path endpoint surface
     /// (health, capabilities, execute, get-status, cancel) with responses built from the
-    /// real Api types via <see cref="BrokerJson"/>. Status responses are drained from
+    /// real Api types via <see cref="BrokerSerializer"/>. Status responses are drained from
     /// <see cref="StatusScript"/>; once a cancel request has been received (or the script
     /// is empty), <see cref="StatusAfterCancel"/> is reported instead.
     /// </summary>
@@ -1234,6 +2365,12 @@ public sealed class PackageOperationsTests
         /// </summary>
         public string? LastExecuteRequestBody { get; private set; }
 
+        /// <summary>When set, the capabilities endpoint answers with this structured error.</summary>
+        public (int StatusCode, BrokerApiErrorCode Code)? CapabilitiesError { get; set; }
+
+        /// <summary>When set, the execute endpoint reports this policy decision without an operation.</summary>
+        public BrokerApiDecisionInfo? Denial { get; set; }
+
         private bool cancelReceived;
 
         public BrokerTransportKind Kind => BrokerTransportKind.HttpNamedPipe;
@@ -1251,9 +2388,19 @@ public sealed class PackageOperationsTests
 
             return request.Path switch
             {
-                "/v1/health" => Json(BrokerJson.Serialize(BuildHealthResponse())),
-                "/v1/capabilities" => Json(BrokerJson.Serialize(BuildCapabilities())),
-                "/v1/package-operations/execute" => Json(BrokerJson.Serialize(BuildExecutionResponse())),
+                "/v1/health" => Json(BrokerSerializer.Serialize(BuildHealthResponse())),
+                "/v1/capabilities" when CapabilitiesError is { } error => Task.FromResult(
+                    new BrokerTransportResponse
+                    {
+                        StatusCode = error.StatusCode,
+                        Body = BrokerSerializer.Serialize(new BrokerApiErrorResponse
+                        {
+                            Code = error.Code,
+                            Message = "capabilities refused",
+                        }),
+                    }),
+                "/v1/capabilities" => Json(BrokerSerializer.Serialize(BuildCapabilities())),
+                "/v1/package-operations/execute" => Json(BrokerSerializer.Serialize(BuildExecutionResponse())),
                 "/v1/package-operations/get-status" => HandleStatusQuery(),
                 "/v1/package-operations/cancel" => HandleCancelRequest(),
                 _ => throw new BrokerClientException(
@@ -1277,7 +2424,7 @@ public sealed class PackageOperationsTests
                     ? StatusAfterCancel
                     : StatusScript.Dequeue();
 
-            return Json(BrokerJson.Serialize(new BrokerApiStatusResponse
+            return Json(BrokerSerializer.Serialize(new BrokerApiStatusResponse
             {
                 ResponseKind = BrokerApiConstants.StatusResponseKind,
                 ResponseVersion = BrokerApiConstants.Version,
@@ -1300,7 +2447,7 @@ public sealed class PackageOperationsTests
 
             cancelReceived = true;
             OnCancelRequested?.Invoke();
-            return Json(BrokerJson.Serialize(new BrokerApiCancelResponse
+            return Json(BrokerSerializer.Serialize(new BrokerApiCancelResponse
             {
                 ResponseKind = BrokerApiConstants.CancelResponseKind,
                 ResponseVersion = BrokerApiConstants.Version,
@@ -1333,6 +2480,7 @@ public sealed class PackageOperationsTests
                 {
                     Manager = BrokerApiManagerName.Chocolatey,
                     Operations = [BrokerApiOperation.Install, BrokerApiOperation.Update, BrokerApiOperation.Uninstall],
+                    Architectures = [BrokerApiArchitecture.X86, BrokerApiArchitecture.X64],
                     SupportsCustomParameters = true,
                     SupportsCustomInstallLocation = true,
                     SupportsCaptureOutput = true,
@@ -1340,25 +2488,38 @@ public sealed class PackageOperationsTests
             ],
         };
 
-        private BrokerApiExecutionResponse BuildExecutionResponse() => new()
+        private BrokerApiExecutionResponse BuildExecutionResponse()
         {
-            ResponseKind = BrokerApiConstants.ExecutionResponseKind,
-            ResponseVersion = BrokerApiConstants.Version,
-            Decision = new BrokerApiDecisionInfo { Decision = BrokerApiDecision.Allow },
-            Operation = new BrokerApiOperationSubmission
+            if (Denial is { } denial)
             {
-                OperationId = OperationId,
-                Status = BrokerApiOperationStatus.Starting,
-                SubmittedAt = DateTimeOffset.UtcNow,
-                EventChannel = EventChannelPipeName is null
-                    ? null
-                    : new BrokerApiEventChannel
-                    {
-                        Kind = BrokerApiEventChannelKind.LocalPipe,
-                        Path = EventChannelPipeName,
-                    },
-            },
-        };
+                return new()
+                {
+                    ResponseKind = BrokerApiConstants.ExecutionResponseKind,
+                    ResponseVersion = BrokerApiConstants.Version,
+                    Decision = denial,
+                };
+            }
+
+            return new()
+            {
+                ResponseKind = BrokerApiConstants.ExecutionResponseKind,
+                ResponseVersion = BrokerApiConstants.Version,
+                Decision = new BrokerApiDecisionInfo { Decision = BrokerApiDecision.Allow },
+                Operation = new BrokerApiOperationSubmission
+                {
+                    OperationId = OperationId,
+                    Status = BrokerApiOperationStatus.Starting,
+                    SubmittedAt = DateTimeOffset.UtcNow,
+                    EventChannel = EventChannelPipeName is null
+                        ? null
+                        : new BrokerApiEventChannel
+                        {
+                            Kind = BrokerApiEventChannelKind.LocalPipe,
+                            Path = EventChannelPipeName,
+                        },
+                },
+            };
+        }
     }
 
     /// <summary>
@@ -1526,6 +2687,61 @@ public sealed class PackageOperationsTests
         {
             return Task.FromResult(_veredict);
         }
+    }
+
+    [Fact]
+    public async Task UnmetPreconditionIsReportedWithoutTheInternalErrorStackTrace()
+    {
+        using var operation = new ThrowingStubOperation(
+            new OperationPreconditionException("Run UniGetUI as a regular user and try again.")
+        );
+
+        await operation.MainThread();
+
+        Assert.Equal(OperationStatus.Failed, operation.Status);
+        var lines = operation.GetOutput().Select(line => line.Item1).ToList();
+        Assert.Contains("Run UniGetUI as a regular user and try again.", lines);
+        Assert.DoesNotContain("An internal error occurred:", lines);
+        Assert.DoesNotContain(lines, line => line.Contains("OperationPreconditionException"));
+    }
+
+    [Fact]
+    public async Task AnUnexpectedExceptionStillReportsItsStackTrace()
+    {
+        using var operation = new ThrowingStubOperation(
+            new InvalidOperationException("some unexpected failure")
+        );
+
+        await operation.MainThread();
+
+        Assert.Equal(OperationStatus.Failed, operation.Status);
+        var lines = operation.GetOutput().Select(line => line.Item1).ToList();
+        Assert.Contains(lines, line => line.Contains("InvalidOperationException"));
+        Assert.Contains(lines, line => line.TrimStart().StartsWith("at ", StringComparison.Ordinal));
+    }
+
+    private sealed class ThrowingStubOperation : AbstractOperation
+    {
+        private readonly Exception _exception;
+
+        public ThrowingStubOperation(Exception exception)
+            : base(queue_enabled: false)
+        {
+            _exception = exception;
+            Metadata.Status = "Throwing stub status";
+            Metadata.Title = "Throwing stub title";
+            Metadata.OperationInformation = "Throwing stub info";
+            Metadata.SuccessTitle = "Throwing stub success";
+            Metadata.SuccessMessage = "Throwing stub success";
+            Metadata.FailureTitle = "Throwing stub failure";
+            Metadata.FailureMessage = "Throwing stub failure";
+        }
+
+        protected override void ApplyRetryAction(string retryMode) { }
+
+        protected override Task<OperationVeredict> PerformOperation() => throw _exception;
+
+        public override Task<Uri> GetOperationIcon() => Task.FromResult(new Uri("about:blank"));
     }
 
     private sealed class CancellationAwareStubOperation : AbstractOperation

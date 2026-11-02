@@ -82,6 +82,7 @@ public sealed partial class TextboxCard : SettingsCard
         };
 
         _textbox = new TextBox { MinWidth = 200, MaxWidth = 300 };
+        _textbox.Classes.Add("search-field-standalone");
 
         var s = new StackPanel { Orientation = Orientation.Horizontal };
         s.Children.Add(_helpbutton);
@@ -108,6 +109,10 @@ public sealed partial class TextboxCard : SettingsCard
 
         if (CoreSettings.ResolveKey(setting_name).Contains("File"))
             sanitizedText = CoreTools.MakeValidFileName(sanitizedText);
+
+        // TextChanged is queued, so loading a setting can reach this handler too.
+        if (sanitizedText == CoreSettings.GetValue(setting_name))
+            return;
 
         if (sanitizedText != "")
             CoreSettings.SetValue(setting_name, sanitizedText);

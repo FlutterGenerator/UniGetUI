@@ -23,6 +23,17 @@ namespace UniGetUI.Core.Data.Tests
         }
 
         [Fact]
+        public void GlobalDirectoryResolvesToTheMachineWidePlatformPath()
+        {
+            string expected = OperatingSystem.IsWindows()
+                ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "Devolutions", "UniGetUI")
+                : OperatingSystem.IsLinux() ? "/etc/UniGetUI"
+                : "/Library/Application Support/Devolutions/UniGetUI";
+            Assert.Equal(expected, CoreData.UniGetUIGlobalDirectory);
+            Assert.True(Path.IsPathFullyQualified(CoreData.UniGetUIGlobalDirectory));
+        }
+
+        [Fact]
         public void CheckOtherAttributes()
         {
             Assert.NotEmpty(CoreData.VersionName);
@@ -98,7 +109,7 @@ namespace UniGetUI.Core.Data.Tests
                 "https://api.github.com/repos/Devolutions/UniGetUI/releases/tags/3.3.7-beta1",
                 CoreData.GetGitHubReleaseApiUrlFromTag("3.3.7-beta1")
             );
-            Assert.Equal("https://devolutions.net/unigetui/release-notes/", CoreData.ReleaseNotesUrl);
+            Assert.Equal("https://devolutions.net/data/UniGetUIChangeHistoryUpdate.htm", CoreData.ReleaseNotesUrl);
             Assert.Equal(CoreData.ReleaseNotesUrl, CoreData.GetGitHubReleasePageUrl());
         }
     }

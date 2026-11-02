@@ -1,9 +1,11 @@
 using UniGetUI.Core.Logging;
+using UniGetUI.Core.Tools;
 using UniGetUI.PackageEngine;
 using UniGetUI.PackageEngine.Classes.Packages.Classes;
 using UniGetUI.PackageEngine.Enums;
 using UniGetUI.PackageEngine.Interfaces;
 using UniGetUI.PackageEngine.Operations;
+using UniGetUI.PackageEngine.Operations.Reboot;
 using UniGetUI.PackageEngine.PackageClasses;
 using UniGetUI.PackageEngine.PackageLoader;
 using UniGetUI.PackageEngine.Serializable;
@@ -20,6 +22,7 @@ public sealed class IpcPackageInfo
     public string Source { get; set; } = "";
     public string Manager { get; set; } = "";
     public bool IsUpgradable { get; set; }
+    public bool SystemRestartPending { get; set; }
 }
 
 public sealed class IpcPackageActionRequest
@@ -51,6 +54,18 @@ public sealed class IpcPackageOperationResult
     public IpcPackageInfo? Package { get; set; }
     public string? OutputPath { get; set; }
     public IReadOnlyList<string> Output { get; set; } = [];
+}
+
+public sealed class IpcPackageBulkOperationResult
+{
+    public string Status { get; set; } = "success";
+    public string Command { get; set; } = "";
+    public bool Completed { get; set; }
+    public string? Message { get; set; }
+    public int QueuedCount { get; set; }
+    public int SucceededCount { get; set; }
+    public int FailedCount { get; set; }
+    public IReadOnlyList<IpcPackageOperationResult> Results { get; set; } = [];
 }
 
 public sealed class IpcPackageDependencyInfo
@@ -123,10 +138,15 @@ public static class IpcPackageApi
 
         maxResults = Math.Clamp(maxResults, 1, 500);
 
+        string safeQuery = CoreTools.EnsureSafeQueryString(query);
+        if (safeQuery.Length is 0)
+            return [];
+
+        var pendingRestartKeys = PendingRebootStore.GetPendingKeys();
         return GetManagers(managerName)
-            .SelectMany(manager => manager.FindPackages(query))
+            .SelectMany(manager => manager.FindPackages(safeQuery))
             .DistinctBy(GetPackageIdentity)
-            .Select(ToIpcPackageInfo)
+            .Select(package => ToIpcPackageInfo(package, pendingRestartKeys))
             .OrderBy(package => package.Name, StringComparer.OrdinalIgnoreCase)
             .ThenBy(package => package.Id, StringComparer.OrdinalIgnoreCase)
             .Take(maxResults)
@@ -135,9 +155,10 @@ public static class IpcPackageApi
 
     public static IReadOnlyList<IpcPackageInfo> ListInstalledPackages(string? managerName = null)
     {
+        var pendingRestartKeys = PendingRebootStore.GetPendingKeys();
         return GetInstalledPackagesSnapshot(managerName)
             .DistinctBy(GetPackageIdentity)
-            .Select(ToIpcPackageInfo)
+            .Select(package => ToIpcPackageInfo(package, pendingRestartKeys))
             .OrderBy(package => package.Name, StringComparer.OrdinalIgnoreCase)
             .ThenBy(package => package.Id, StringComparer.OrdinalIgnoreCase)
             .ToArray();
@@ -145,9 +166,10 @@ public static class IpcPackageApi
 
     public static IReadOnlyList<IpcPackageInfo> ListUpgradablePackages(string? managerName = null)
     {
+        var pendingRestartKeys = PendingRebootStore.GetPendingKeys();
         return GetUpgradablePackagesSnapshot(managerName)
             .DistinctBy(GetPackageIdentity)
-            .Select(ToIpcPackageInfo)
+            .Select(package => ToIpcPackageInfo(package, pendingRestartKeys))
             .OrderBy(package => package.Name, StringComparer.OrdinalIgnoreCase)
             .ThenBy(package => package.Id, StringComparer.OrdinalIgnoreCase)
             .ToArray();
@@ -183,6 +205,80 @@ public static class IpcPackageApi
         );
     }
 
+    /// <summary>
+    /// Queues an update for every available update, or for those of one manager, and returns the
+    /// operations it started. Sessions with a window queue them through the window instead, so
+    /// they show in its operations list; this is what a headless session uses.
+    /// </summary>
+    public static async Task<IReadOnlyList<AbstractOperation>> QueueAllUpdatesAsync(
+        string? managerName = null
+    )
+    {
+        List<AbstractOperation> operations = [];
+        foreach (var package in await GetUpdatesToApplyAsync(managerName))
+        {
+            var options = await InstallOptionsFactory.LoadApplicableAsync(package);
+            if (PackageOperation.HasPendingOperation(package, OperationType.Update))
+            {
+                continue;
+            }
+
+            var operation = new UpdatePackageOperation(package, options);
+            IpcOperationApi.Track(operation);
+            _ = Task.Run(() => RunTrackedOperationAsync(operation));
+            operations.Add(operation);
+        }
+
+        return operations;
+    }
+
+    internal static IpcPackageBulkOperationResult CreateQueuedBulkResult(
+        string command,
+        IReadOnlyList<AbstractOperation> operations
+    )
+    {
+        var results = operations
+            .OfType<PackageOperation>()
+            .Select(operation =>
+                CreateOperationResult(command, operation.Package, operation, completed: false)
+            )
+            .ToArray();
+
+        return new IpcPackageBulkOperationResult
+        {
+            Command = command,
+            Completed = results.Length == 0,
+            Message = results.Length == 0
+                ? "No updates are available."
+                : "The updates were queued for background execution.",
+            QueuedCount = results.Length,
+            Results = results,
+        };
+    }
+
+    // Reads the update list the app shows, never the managers' raw lists: only the loader applies
+    // ignored updates, skipped minor updates and the minimum update age.
+    private static async Task<IReadOnlyList<IPackage>> GetUpdatesToApplyAsync(string? managerName)
+    {
+        var loader = UpgradablePackagesLoader.Instance
+            ?? throw new InvalidOperationException(
+                "The current UniGetUI session has not loaded its package updates."
+            );
+
+        if (loader.IsLoading)
+        {
+            await loader.WaitForCurrentLoadAsync();
+        }
+        else if (!loader.IsLoaded)
+        {
+            await loader.ReloadPackages();
+        }
+
+        return loader.Packages
+            .Where(package => MatchesManager(package.Manager, managerName))
+            .ToArray();
+    }
+
     public static Task<IpcPackageOperationResult> UninstallPackageAsync(
         IpcPackageActionRequest request
     )
@@ -204,13 +300,6 @@ public static class IpcPackageApi
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        if (string.IsNullOrWhiteSpace(request.OutputPath))
-        {
-            throw new InvalidOperationException(
-                "The outputPath parameter is required when downloading a package."
-            );
-        }
-
         var package = FindAnyPackage(request);
         if (!package.Manager.Capabilities.CanDownloadInstaller)
         {
@@ -219,7 +308,20 @@ public static class IpcPackageApi
             );
         }
 
-        var operation = new DownloadOperation(package, request.OutputPath);
+        string outputPath = request.OutputPath ?? "";
+        if (string.IsNullOrWhiteSpace(outputPath))
+        {
+            outputPath = InstallerDownloadLocation.ResolveExistingDirectory();
+            if (!Directory.Exists(outputPath))
+            {
+                throw new InvalidOperationException(
+                    "The outputPath parameter is required when downloading a package: the "
+                        + $"configured download location \"{outputPath}\" could not be created."
+                );
+            }
+        }
+
+        var operation = new DownloadOperation(package, outputPath);
         string operationId = IpcOperationApi.Track(operation);
 
         if (request.WaitForCompletion == false)
@@ -356,6 +458,17 @@ public static class IpcPackageApi
     {
         ArgumentNullException.ThrowIfNull(request);
         return FindAnyPackage(request);
+    }
+
+    /// <summary>
+    /// Finds the package a manager search returns for the exact id (and source, when given),
+    /// as the Discover page would show it. Unlike <see cref="ResolvePackage"/> it never loads
+    /// the installed or upgradable lists first, so it stays quick on a cold start.
+    /// </summary>
+    public static IPackage FindCatalogPackage(IpcPackageActionRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        return FindSearchResult(request);
     }
 
     public static IReadOnlyList<string> GetPackageVersions(IpcPackageActionRequest request)
@@ -789,6 +902,12 @@ public static class IpcPackageApi
     }
 
     private static IpcPackageInfo ToIpcPackageInfo(IPackage package)
+        => ToIpcPackageInfo(package, null);
+
+    private static IpcPackageInfo ToIpcPackageInfo(
+        IPackage package,
+        IReadOnlySet<string>? pendingRestartKeys
+    )
     {
         return new IpcPackageInfo
         {
@@ -799,6 +918,10 @@ public static class IpcPackageApi
             Source = package.Source.AsString_DisplayName,
             Manager = IpcManagerSettingsApi.GetPublicManagerId(package.Manager),
             IsUpgradable = package.IsUpgradable,
+            SystemRestartPending = pendingRestartKeys is null
+                ? PendingRebootStore.IsPending(package.Manager.Id, package.Id)
+                : pendingRestartKeys.Contains(
+                    PendingRebootStore.KeyFor(package.Manager.Id, package.Id)),
         };
     }
 }

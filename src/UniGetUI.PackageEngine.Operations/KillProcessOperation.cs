@@ -8,11 +8,13 @@ namespace UniGetUI.PackageOperations;
 public class KillProcessOperation : AbstractOperation
 {
     private readonly string ProcessName;
+    private readonly bool ForceKill;
 
-    public KillProcessOperation(string procName)
+    public KillProcessOperation(string procName, bool forceKill = false)
         : base(false)
     {
         ProcessName = CoreTools.MakeValidFileName(procName);
+        ForceKill = forceKill;
         Metadata.Status = CoreTools.Translate("Closing process(es) {0}", procName);
         Metadata.Title = CoreTools.Translate("Closing process(es) {0}", procName);
         Metadata.OperationInformation = " ";
@@ -32,6 +34,7 @@ public class KillProcessOperation : AbstractOperation
                 $"Attempting to close all processes with name {ProcessName}...",
                 LineType.Information
             );
+            bool processSurvived = false;
             foreach (var proc in Process.GetProcessesByName(ProcessName.Replace(".exe", "")))
             {
                 using (proc)
@@ -51,7 +54,7 @@ public class KillProcessOperation : AbstractOperation
                     CancellationToken.ThrowIfCancellationRequested();
                     if (!proc.HasExited)
                     {
-                        if (Settings.Get(Settings.K.KillProcessesThatRefuseToDie))
+                        if (ForceKill || Settings.Get(Settings.K.KillProcessesThatRefuseToDie))
                         {
                             Line(
                                 $"Timeout for process {ProcessName}, attempting to kill...",
@@ -66,12 +69,13 @@ public class KillProcessOperation : AbstractOperation
                                 $"{ProcessName} with pid={proc.Id} did not exit and will not be killed. You can change this from UniGetUI settings.",
                                 LineType.Error
                             );
+                            processSurvived = true;
                         }
                     }
                 }
             }
 
-            return OperationVeredict.Success;
+            return processSurvived ? OperationVeredict.Failure : OperationVeredict.Success;
         }
         catch (OperationCanceledException) when (CancellationToken.IsCancellationRequested)
         {

@@ -31,8 +31,7 @@ public static class IpcCliSyntax
             return new(IpcCliParseStatus.NotIpcCommand);
         }
 
-        if (args.Any(arg => string.Equals(arg, "--help", StringComparison.OrdinalIgnoreCase))
-            || args.Any(arg => string.Equals(arg, "-h", StringComparison.OrdinalIgnoreCase)))
+        if (IsHelpRequest(args))
         {
             return new(IpcCliParseStatus.Help);
         }
@@ -119,6 +118,12 @@ public static class IpcCliSyntax
         );
     }
 
+    public static bool IsHelpRequest(IReadOnlyList<string> args)
+    {
+        return args.Any(arg => string.Equals(arg, "--help", StringComparison.OrdinalIgnoreCase))
+            || args.Any(arg => string.Equals(arg, "-h", StringComparison.OrdinalIgnoreCase));
+    }
+
     public static bool IsIpcCommand(IReadOnlyList<string> args)
     {
         return Parse(args).Status is IpcCliParseStatus.Success or IpcCliParseStatus.Help;
@@ -153,6 +158,7 @@ Global options:
   --pipe-name <name>
 
 Core commands:
+  tui [options] [bundle-file]   (local terminal UI; use tui --help for options)
   status
   version
   app status|show|navigate|quit
@@ -174,8 +180,8 @@ Core commands:
   bundle get|reset|import|export|add|remove|install
   package search|details|versions|installed|updates|install|download|reinstall|repair|update|uninstall|show
   package ignored list|add|remove
-  package update-all
-  package update-manager
+  package update-all [--manager <id>] [--wait true|false] [--timeout <seconds>]
+  package update-manager --manager <id> [--wait true|false] [--timeout <seconds>]
 
 Examples:
   unigetui status
@@ -183,6 +189,7 @@ Examples:
   unigetui package search --manager dotnet-tool --query dotnetsay
   unigetui package install --manager dotnet-tool --id dotnetsay --version 2.1.4 --scope Global
   unigetui operation wait --id 123 --timeout 300
+  unigetui package update-all --wait true
   unigetui backup local create
   unigetui backup github login start --launch-browser
 """;

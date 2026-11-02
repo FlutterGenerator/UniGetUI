@@ -223,7 +223,7 @@ These keys are used by package-related endpoints such as install, update, uninst
 | `wait` | Boolean |
 | `architecture` | Architecture override |
 | `location` | Install location override |
-| `outputPath` | Download output path |
+| `outputPath` | Download output path. Defaults to the download location configured in the settings, or to the user's Downloads folder |
 
 ### App navigation query parameters
 
@@ -248,12 +248,16 @@ These keys are used by package-related endpoints such as install, update, uninst
 | Method | Path | Auth | Parameters/body | CLI equivalent | Notes |
 | --- | --- | --- | --- | --- | --- |
 | `GET` | `/uniget/v1/status` | No | None | `status`, `version` | Returns `running`, `transport`, `tcpPort`, `namedPipeName`, `namedPipePath`, `baseAddress`, `version`, and `buildNumber`. |
-| `GET` | `/uniget/v1/app` | Yes | None | `app status` | Returns app/headless/window state. |
+| `GET` | `/uniget/v1/app` | Yes | None | `app status` | Returns app/headless/window state, plus `systemRestartPending` and `systemRestartPendingPackages` (see [Pending machine restarts](#pending-machine-restarts)). |
 | `POST` | `/uniget/v1/app/show` | Yes | None | `app show` | UI-only in practice. |
 | `POST` | `/uniget/v1/app/navigate` | Yes | Query: `page`, optional `manager`, optional `helpAttachment` | `app navigate` | UI-only in practice. |
 | `POST` | `/uniget/v1/app/quit` | Yes | None | `app quit` | Shuts down the selected session. |
 
 ### Operations
+
+Every operation payload carries `systemRestartRequired`: `true` when the operation succeeded but
+the machine must be restarted before the change takes effect. See
+[Pending machine restarts](#pending-machine-restarts).
 
 | Method | Path | Auth | Parameters/body | CLI equivalent |
 | --- | --- | --- | --- | --- |
@@ -380,6 +384,10 @@ them first.
 
 ### Packages
 
+Every package payload carries `systemRestartPending`: `true` when that package is one of the
+packages this machine is waiting on a restart for. See
+[Pending machine restarts](#pending-machine-restarts).
+
 | Method | Path | Auth | Parameters/body | CLI equivalent | Notes |
 | --- | --- | --- | --- | --- | --- |
 | `GET` | `/uniget/v1/packages/search` | Yes | Query `query`, optional `manager`, optional `maxResults` | `package search` | Search endpoint. |
@@ -397,8 +405,56 @@ them first.
 | `POST` | `/uniget/v1/packages/uninstall` | Yes | Package action query set | `package uninstall` | Uninstalls package. |
 | `POST` | `/uniget/v1/packages/uninstall-then-reinstall` | Yes | Package action query set | `package repair` | Repair flow. |
 | `POST` | `/uniget/v1/packages/show` | Yes | Query `packageId`, `packageSource` | `package show` | UI-oriented package-details flow. |
-| `POST` | `/uniget/v1/packages/update-all` | Yes | None | `package update-all` | Requires `OnUpgradeAll` handler to be wired. |
-| `POST` | `/uniget/v1/packages/update-manager` | Yes | Query `manager` | `package update-manager` | Requires `OnUpgradeAllForManager` handler to be wired. |
+| `POST` | `/uniget/v1/packages/update-all` | Yes | Optional query `manager` | `package update-all` | Queues an update for every available update and returns their operation ids. See [Updating everything](#updating-everything). |
+| `POST` | `/uniget/v1/packages/update-manager` | Yes | Query `manager` | `package update-manager` | Same as `update-all` with `manager` set. |
+
+## Updating everything
+
+`update-all` and `update-manager` queue one update operation per available update and return at
+once; they never wait for the updates themselves. They update what the Software Updates page
+lists, so ignored updates, skipped minor updates and the minimum update age apply, and a package
+that already has an update queued or running is skipped. If the update list has not been loaded
+yet, the request waits for that first load.
+
+The response lists the operations it queued:
+
+```json
+{
+  "status": "success",
+  "command": "update-all",
+  "completed": false,
+  "message": "The updates were queued for background execution.",
+  "queuedCount": 2,
+  "succeededCount": 0,
+  "failedCount": 0,
+  "results": [
+    { "status": "success", "operationId": "…", "operationStatus": "inqueue", "completed": false, "package": { "id": "Git.Git", "manager": "winget" } }
+  ]
+}
+```
+
+Follow each one through `/uniget/v1/operations/{operationId}`, or let the CLI do it with
+`package update-all --wait true`. With no updates available, `queuedCount` is `0`, `completed` is
+`true` and `results` is empty.
+
+In a session with a window, the window queues the updates, so they also appear in its operations
+list. A headless session queues them itself.
+
+## Pending machine restarts
+
+Some installers finish successfully but only take effect after the machine reboots (WinGet
+`0x8A150109`/`0x8A15010B`, Chocolatey `3010`/`1641`). UniGetUI records those packages and keeps the
+record until the machine has actually rebooted — closing and reopening UniGetUI does not clear it.
+
+These fields expose it, so a fleet tool can tell which machines are waiting on a restart and why:
+
+| Payload | Field | Meaning |
+| --- | --- | --- |
+| `GET /uniget/v1/app` | `systemRestartPending` | The machine is waiting on a restart. |
+| `GET /uniget/v1/app` | `systemRestartPendingPackages` | How many packages are waiting on it. |
+| Operation payloads | `systemRestartRequired` | This operation succeeded but needs a restart. |
+| Operation-history entries | `systemRestartRequired` | Same, for a finished operation. |
+| Package payloads | `systemRestartPending` | This package is waiting on a restart. |
 
 ## Headless-specific limitations
 
@@ -406,8 +462,6 @@ In headless sessions:
 
 - `POST /uniget/v1/app/show` fails because there is no window to show.
 - `POST /uniget/v1/app/navigate` fails because there is no UI page stack to navigate.
-- `POST /uniget/v1/packages/update-all` fails unless a host wires `OnUpgradeAll`.
-- `POST /uniget/v1/packages/update-manager` fails unless a host wires `OnUpgradeAllForManager`.
 
 These failures are intentional and surfaced as HTTP `400` with a descriptive message.
 

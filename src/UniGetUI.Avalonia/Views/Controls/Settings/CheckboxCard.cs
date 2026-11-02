@@ -71,6 +71,7 @@ public partial class CheckboxCard : SettingsCard
         {
             _textblock.Text = value;
             ApplyAutomationMetadata(_checkbox, value, _warningBlock.IsVisible ? _warningBlock.Text : null);
+            SyncToggleItemStatus();
         }
     }
 
@@ -81,6 +82,7 @@ public partial class CheckboxCard : SettingsCard
             _warningBlock.Text = CoreTools.FormatAsTwoLines(value);
             _warningBlock.IsVisible = value.Any();
             ApplyAutomationMetadata(_checkbox, _textblock.Text, _warningBlock.IsVisible ? value : null);
+            SyncToggleItemStatus();
         }
     }
 
@@ -103,6 +105,7 @@ public partial class CheckboxCard : SettingsCard
         AutomationProperties.SetControlTypeOverride(_checkbox, AutomationControlType.CheckBox);
         _stateLabel = new TextBlock
         {
+            Classes = { "toggle-state-label" },
             Text = DisabledLabel,
             VerticalAlignment = VerticalAlignment.Center,
             Margin = new Thickness(0, 0, 8, 0),
@@ -129,6 +132,7 @@ public partial class CheckboxCard : SettingsCard
         Content = new StackPanel
         {
             Orientation = Orientation.Horizontal,
+            HorizontalAlignment = HorizontalAlignment.Right,
             VerticalAlignment = VerticalAlignment.Center,
             Children = { _stateLabel, _checkbox },
         };
@@ -142,14 +146,9 @@ public partial class CheckboxCard : SettingsCard
         _checkbox.IsCheckedChanged += _checkbox_Toggled;
         ApplyAutomationMetadata(_checkbox, _textblock.Text);
 
-        // The SettingsCard measures the Header with infinite width, so TextWrapping
-        // alone won't constrain the warning block. Fix it by updating MaxWidth after
-        // every layout pass, leaving room for the Content (toggle) area.
-        SizeChanged += (_, e) =>
-        {
-            var contentWidth = (Content as Control)?.Bounds.Width ?? 0;
-            _warningBlock.MaxWidth = Math.Max(100, e.NewSize.Width - contentWidth - 48);
-        };
+        // Header width is constrained by SettingsCard's responsive grid, so both the title
+        // and warning text wrap naturally around the right-side toggle.
+        RightAlignWrappedContent = true;
     }
 
     protected void UpdateStateLabel()
@@ -174,20 +173,7 @@ public partial class CheckboxCard : SettingsCard
     }
 
     protected void SyncToggleItemStatus()
-    {
-        string state = (_checkbox.IsChecked ?? false)
-            ? CoreTools.Translate("Enabled")
-            : CoreTools.Translate("Disabled");
-        // ItemStatus: some screen readers read this separately
-        AutomationProperties.SetItemStatus(_checkbox, state);
-        // Name with state suffix: guarantees VoiceOver announces state on macOS
-        // where ToggleSwitch AX role may not expose IsChecked natively
-        string? baseName = _textblock.Text;
-        if (!string.IsNullOrEmpty(baseName))
-        {
-            AutomationProperties.SetName(_checkbox, $"{baseName}, {state}");
-        }
-    }
+        => ApplyToggleAutomationState(_checkbox, _checkbox.IsChecked ?? false, _textblock.Text);
 }
 
 public partial class CheckboxCard_Dict : CheckboxCard

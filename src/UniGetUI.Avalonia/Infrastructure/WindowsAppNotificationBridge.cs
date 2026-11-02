@@ -35,13 +35,16 @@ internal static class WindowsAppNotificationBridge
     /// </summary>
     public static string? TryParseToastLaunchArgument(string arg)
     {
-        if (string.IsNullOrEmpty(arg))
+        // Package links name a package rather than an action; StartupArgumentProcessor opens them.
+        if (string.IsNullOrEmpty(arg) || PackageLink.IsPackageLink(arg))
             return null;
 
         const string prefix = "unigetui://";
-        return arg.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
-            ? arg[prefix.Length..]
-            : null;
+        if (!arg.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        string action = arg[prefix.Length..].Trim('/');
+        return action.Length > 0 ? action : null;
     }
 
     /// <summary>Raises <see cref="NotificationActivated"/> with the given action.</summary>
@@ -70,13 +73,8 @@ internal static class WindowsAppNotificationBridge
 
     public static bool ShowSuccess(AbstractOperation operation)
     {
-        string title = operation.Metadata.SuccessTitle.Length > 0
-            ? operation.Metadata.SuccessTitle
-            : CoreTools.Translate("Success!");
-
-        string message = operation.Metadata.SuccessMessage.Length > 0
-            ? operation.Metadata.SuccessMessage
-            : CoreTools.Translate("Success!");
+        string title = OperationNotificationText.SuccessTitle(operation);
+        string message = OperationNotificationText.SuccessMessage(operation);
 
         return Show(title, message, MainWindow.RuntimeNotificationLevel.Success, launchAction: NotificationArguments.Show, allowInAppFallback: false);
     }
@@ -261,6 +259,8 @@ internal static class WindowsAppNotificationBridge
         return true;
     }
 
+#if WINDOWS
     private static string BuildLaunchArgument(string action)
         => $"unigetui://{action}";
+#endif
 }

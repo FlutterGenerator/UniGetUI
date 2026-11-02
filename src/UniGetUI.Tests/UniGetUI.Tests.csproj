@@ -13,6 +13,7 @@
     </PropertyGroup>
 
     <ItemGroup>
+        <PackageReference Include="Avalonia.Headless" Version="12.0.4" />
         <PackageReference Include="coverlet.collector" Version="6.0.4">
             <PrivateAssets>all</PrivateAssets>
             <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
@@ -36,6 +37,8 @@
         <ProjectReference Include="..\UniGetUI.Core.SecureSettings\UniGetUI.Core.SecureSettings.csproj" />
         <ProjectReference Include="..\UniGetUI.Core.Settings\UniGetUI.Core.Settings.csproj" />
         <ProjectReference Include="..\UniGetUI.Core.Tools\UniGetUI.Core.Tools.csproj" />
+        <ProjectReference Include="..\UniGetUI.PackageEngine.AgentBroker\UniGetUI.PackageEngine.AgentBroker.csproj" />
+        <ProjectReference Include="..\UniGetUI.Avalonia\UniGetUI.Avalonia.csproj" />
     </ItemGroup>
 
     <ItemGroup>
@@ -46,6 +49,6 @@
         <Compile Include="..\SharedAssemblyInfo.cs" Link="SharedAssemblyInfo.cs" />
         <Compile Include="..\Shared\SharedPreUiCommandDispatcher.cs" Link="Shared\SharedPreUiCommandDispatcher.cs" />
         <Compile Include="..\Shared\StartupBundleArguments.cs" Link="Shared\StartupBundleArguments.cs" />
-        <Compile Include="..\Shared\AutoUpdater.Helpers.cs" Link="AutoUpdater.Helpers.cs" />
+        <Compile Include="..\Shared\AutoUpdater.InstallerArguments.cs" Link="Shared\AutoUpdater.InstallerArguments.cs" />
     </ItemGroup>
 </Project>

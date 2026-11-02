@@ -31,9 +31,12 @@ public class InstalledPackagesPage : AbstractPackagesPage
     private MenuItem? _menuUninstallThenReinstall;
     private MenuItem? _menuIgnoreUpdates;
     private MenuItem? _menuDetails;
+    private MenuItem? _menuCopyLink;
     private MenuItem? _menuOpenInstallLocation;
     private MenuItem? _menuDownloadInstaller;
     private MenuItem? _menuManual;
+    private MenuItem? _menuUpdate;
+    private MenuItem? _menuUpdateAsAdmin;
 
     private static bool _hasBackedUp;
 
@@ -91,32 +94,36 @@ public class InstalledPackagesPage : AbstractPackagesPage
         var downloadInstallers = new MenuItem { Header = CoreTools.Translate("Download selected installers") };
 
         SetMainButton("delete", CoreTools.Translate("Uninstall selection"), () =>
-            _ = LaunchUninstall(vm.FilteredPackages.GetCheckedPackages()));
+            _ = ConfirmAndLaunchUninstall(vm.FilteredPackages.GetCheckedPackages()));
 
+        EnableMainButtonWhenPackagesChecked();
         SetMainButtonDropdown(new MenuFlyout
         {
             Items = { uninstallAsAdmin, uninstallInteractive, new Separator(), downloadInstallers },
         });
 
-        uninstallAsAdmin.Click += (_, _) => _ = LaunchUninstall(vm.FilteredPackages.GetCheckedPackages(), elevated: true);
-        uninstallInteractive.Click += (_, _) => _ = LaunchUninstall(vm.FilteredPackages.GetCheckedPackages(), interactive: true);
+        uninstallAsAdmin.Click += (_, _) => _ = ConfirmAndLaunchUninstall(vm.FilteredPackages.GetCheckedPackages(), elevated: true);
+        uninstallInteractive.Click += (_, _) => _ = ConfirmAndLaunchUninstall(vm.FilteredPackages.GetCheckedPackages(), interactive: true);
         downloadInstallers.Click += (_, _) => _ = AvaloniaPackageOperationHelper.DownloadSelectedAsync(
             vm.FilteredPackages.GetCheckedPackages(), TEL_InstallReferral.ALREADY_INSTALLED);
 
         // ── Toolbar buttons ─────────────────────────────────────────────────
+        ViewModel.AddToolbarSeparator(subgroup: !ViewModel.DisableReload);
+        EnableWhen(ViewModel.AddToolbarButton("options", CoreTools.Translate("Uninstall options"),
+            () => _ = ShowInstallationOptionsForPackage(SelectedItem), showLabel: false), () => HasSelectedItem);
+        ViewModel.AddToolbarSeparator(subgroup: true);
+        EnableWhen(ViewModel.AddToolbarButton("console", CoreTools.Translate("Manual uninstall"),
+            () => _ = ManualInstallHelper.LaunchManualAsync(SelectedItem, OperationType.Uninstall)), () => HasSelectedItem);
+        ViewModel.AddToolbarSeparator(subgroup: true);
+        EnableWhen(ViewModel.AddToolbarButton("info_round", CoreTools.Translate("Package details"),
+            () => _ = ShowDetailsForPackage(SelectedItem), showLabel: false), () => HasSelectedItem);
         ViewModel.AddToolbarSeparator();
-        ViewModel.AddToolbarButton("options", CoreTools.Translate("Uninstall options"),
-            () => _ = ShowInstallationOptionsForPackage(SelectedItem), showLabel: false);
-        ViewModel.AddToolbarSeparator();
-        ViewModel.AddToolbarButton("console", CoreTools.Translate("Manual uninstall"),
-            () => _ = ManualInstallHelper.LaunchManualAsync(SelectedItem, OperationType.Uninstall));
-        ViewModel.AddToolbarSeparator();
-        ViewModel.AddToolbarButton("info_round", CoreTools.Translate("Package details"),
-            () => _ = ShowDetailsForPackage(SelectedItem), showLabel: false);
-        ViewModel.AddToolbarSeparator();
-        ViewModel.AddToolbarButton("pin", CoreTools.Translate("Ignore selected packages"), async () =>
+        var ignoreButton = ViewModel.AddToolbarButton("pin", CoreTools.Translate("Ignore selected packages"), async () =>
         {
-            foreach (var pkg in vm.FilteredPackages.GetCheckedPackages())
+            var packages = vm.FilteredPackages.GetCheckedPackages().ToList();
+            if (MainWindow.Instance is not { } window
+                || !await IgnoreUpdatesConfirmationDialog.ConfirmAsync(window, packages)) return;
+            foreach (var pkg in packages)
             {
                 if (!pkg.Source.IsVirtualManager)
                 {
@@ -125,11 +132,12 @@ public class InstalledPackagesPage : AbstractPackagesPage
                 }
             }
         });
+        EnableWhen(ignoreButton, () => HasCheckedPackages);
         ViewModel.AddToolbarButton("clipboard_list", CoreTools.Translate("Manage ignored updates"),
             () => vm.RequestManageIgnoredCommand.Execute(null));
-        ViewModel.AddToolbarSeparator();
-        ViewModel.AddToolbarButton("add_to", CoreTools.Translate("Add selection to bundle"),
-            () => _ = ExportSelectionToBundleAsync(vm));
+        ViewModel.AddToolbarSeparator(subgroup: true);
+        EnableWhen(ViewModel.AddToolbarButton("add_to", CoreTools.Translate("Add selection to bundle"),
+            () => _ = ExportSelectionToBundleAsync(vm)), () => HasCheckedPackages);
         ViewModel.AddToolbarButton("save_as", CoreTools.Translate("Export to CSV"),
             () => _ = ExportPackagesToCsvAsync());
     }
@@ -142,7 +150,7 @@ public class InstalledPackagesPage : AbstractPackagesPage
             Header = ShortcutHeader(CoreTools.Translate("Uninstall"), MainActionShortcut),
             Icon = LoadMenuIcon("delete"),
         };
-        menuUninstall.Click += (_, _) => _ = LaunchUninstall([SelectedItem!]);
+        menuUninstall.Click += (_, _) => _ = ConfirmAndLaunchUninstall([SelectedItem!]);
 
         _menuInstallationOptions = new MenuItem
         {
@@ -167,21 +175,36 @@ public class InstalledPackagesPage : AbstractPackagesPage
             Icon = LoadMenuIcon("uac"),
             IsVisible = OperatingSystem.IsWindows(),
         };
-        _menuAsAdmin.Click += (_, _) => _ = LaunchUninstall([SelectedItem!], elevated: true);
+        _menuAsAdmin.Click += (_, _) => _ = ConfirmAndLaunchUninstall([SelectedItem!], elevated: true);
 
         _menuInteractive = new MenuItem
         {
             Header = CoreTools.Translate("Interactive uninstall"),
             Icon = LoadMenuIcon("interactive"),
         };
-        _menuInteractive.Click += (_, _) => _ = LaunchUninstall([SelectedItem!], interactive: true);
+        _menuInteractive.Click += (_, _) => _ = ConfirmAndLaunchUninstall([SelectedItem!], interactive: true);
 
         _menuRemoveData = new MenuItem
         {
             Header = CoreTools.Translate("Uninstall and remove data"),
             Icon = LoadMenuIcon("close_round"),
         };
-        _menuRemoveData.Click += (_, _) => _ = LaunchUninstall([SelectedItem!], remove_data: true);
+        _menuRemoveData.Click += (_, _) => _ = ConfirmAndLaunchUninstall([SelectedItem!], remove_data: true);
+
+        _menuUpdate = new MenuItem
+        {
+            Header = CoreTools.Translate("Update"),
+            Icon = LoadMenuIcon("update"),
+        };
+        _menuUpdate.Click += (_, _) => _ = LaunchUpdate(SelectedItem);
+
+        _menuUpdateAsAdmin = new MenuItem
+        {
+            Header = CoreTools.Translate("Update as administrator"),
+            Icon = LoadMenuIcon("uac"),
+            IsVisible = OperatingSystem.IsWindows(),
+        };
+        _menuUpdateAsAdmin.Click += (_, _) => _ = LaunchUpdate(SelectedItem, elevated: true);
 
         _menuDownloadInstaller = new MenuItem
         {
@@ -219,6 +242,8 @@ public class InstalledPackagesPage : AbstractPackagesPage
         };
         _menuDetails.Click += (_, _) => _ = ShowDetailsForPackage(SelectedItem);
 
+        _menuCopyLink = CreateCopyLinkMenuItem();
+
         var menu = new ContextMenu();
         menu.Items.Add(menuUninstall);
         menu.Items.Add(new Separator());
@@ -230,6 +255,9 @@ public class InstalledPackagesPage : AbstractPackagesPage
         menu.Items.Add(_menuInteractive);
         menu.Items.Add(_menuRemoveData);
         menu.Items.Add(new Separator());
+        menu.Items.Add(_menuUpdate);
+        menu.Items.Add(_menuUpdateAsAdmin);
+        menu.Items.Add(new Separator());
         menu.Items.Add(_menuDownloadInstaller);
         menu.Items.Add(new Separator());
         menu.Items.Add(_menuReinstall);
@@ -238,16 +266,18 @@ public class InstalledPackagesPage : AbstractPackagesPage
         menu.Items.Add(_menuIgnoreUpdates);
         menu.Items.Add(new Separator());
         menu.Items.Add(_menuDetails);
+        menu.Items.Add(_menuCopyLink);
 
         return menu;
     }
 
     protected override void WhenShowingContextMenu(IPackage package)
     {
-        if (_menuAsAdmin is null || _menuInteractive is null || _menuRemoveData is null
+        if (_menuUpdate is null || _menuUpdateAsAdmin is null
+            || _menuAsAdmin is null || _menuInteractive is null || _menuRemoveData is null
             || _menuInstallationOptions is null || _menuReinstall is null
             || _menuUninstallThenReinstall is null || _menuIgnoreUpdates is null
-            || _menuDetails is null
+            || _menuDetails is null || _menuCopyLink is null
             || _menuOpenInstallLocation is null || _menuDownloadInstaller is null
             || _menuManual is null)
         {
@@ -262,11 +292,23 @@ public class InstalledPackagesPage : AbstractPackagesPage
         _menuAsAdmin.IsEnabled = caps.CanRunAsAdmin;
         _menuInteractive.IsEnabled = caps.CanRunInteractively;
         _menuRemoveData.IsEnabled = caps.CanRemoveDataOnUninstall;
+
+        // The installed entry knows no target version; its upgradable counterpart does,
+        // and is null whenever no update is pending for the package.
+        var upgradable = package.GetUpgradablePackage();
+        bool canUpdate = upgradable is not null;
+        _menuUpdate.IsEnabled = canUpdate;
+        _menuUpdate.Header = upgradable is null
+            ? CoreTools.Translate("Update")
+            : CoreTools.Translate("Update to version {0}", upgradable.NewVersionString);
+        _menuUpdateAsAdmin.IsEnabled = canUpdate && caps.CanRunAsAdmin;
+
         _menuDownloadInstaller.IsEnabled = !isLocal && caps.CanDownloadInstaller;
         _menuInstallationOptions.IsEnabled = !isLocal;
         _menuReinstall.IsEnabled = !isLocal;
         _menuUninstallThenReinstall.IsEnabled = !isLocal;
         _menuDetails.IsEnabled = !isLocal;
+        _menuCopyLink.IsEnabled = PackageLink.CanLinkTo(package);
         _menuOpenInstallLocation.IsEnabled =
             package.Manager.DetailsHelper.GetInstallLocation(package) is not null;
 
@@ -278,8 +320,13 @@ public class InstalledPackagesPage : AbstractPackagesPage
     protected override void PerformMainPackageAction(IPackage? package)
     {
         if (package is null) return;
-        _ = LaunchUninstall([package]);
+        _ = ConfirmAndLaunchUninstall([package]);
     }
+
+    protected override bool SupportsDetailsPane => true;
+
+    protected override PackageDetailsWindow CreateDetailsPaneView(IPackage package) =>
+        new(package, OperationType.Uninstall, TEL_InstallReferral.ALREADY_INSTALLED, embedded: true);
 
     protected override async Task ShowDetailsForPackage(IPackage? package)
     {
@@ -305,7 +352,7 @@ public class InstalledPackagesPage : AbstractPackagesPage
         await InstallOptionsFactory.SaveForPackageAsync(opts, package);
 
         if (dialog.ShouldProceedWithOperation)
-            await LaunchUninstall([package]);
+            await ConfirmAndLaunchUninstall([package]);
     }
 
     // ─── WinGet malfunction banner ────────────────────────────────────────────
@@ -351,13 +398,43 @@ public class InstalledPackagesPage : AbstractPackagesPage
             await PackageBundlesLoader.Instance.AddPackagesAsync(packages);
     }
 
-    private static async Task LaunchUninstall(
+    // Uninstalling cannot be undone, so every page entry point confirms first: toolbar, context menu,
+    // Ctrl+Enter, double-click and the options dialog. The details window confirms in its own window,
+    // and the catalog before calling LaunchUninstall, so neither asks twice.
+    private static async Task ConfirmAndLaunchUninstall(
         IEnumerable<IPackage> packages,
         bool? elevated = null,
         bool? interactive = null,
         bool? remove_data = null)
     {
+        var list = ExcludeNonUninstallable(packages);
+        if (list.Count == 0 || MainWindow.Instance is not { } window) return;
+        if (!await UninstallConfirmationDialog.ConfirmAsync(window, list)) return;
+
+        await LaunchUninstall(list, elevated, interactive, remove_data);
+    }
+
+    // Installer packages (.pkg) have no uninstaller: say so instead of queuing an operation that fails.
+    private static List<IPackage> ExcludeNonUninstallable(IEnumerable<IPackage> packages)
+    {
         var list = packages.ToList();
+        var refused = list.Where(p => !p.Manager.Capabilities.CanUninstall).ToList();
+        if (refused.Count > 0)
+            MainWindow.Instance?.ShowBanner(
+                CoreTools.Translate("Some packages cannot be uninstalled"),
+                CoreTools.Translate("{0} cannot be uninstalled from UniGetUI. Ask your administrator to remove it.",
+                    string.Join(", ", refused.Select(p => p.Name))),
+                MainWindow.RuntimeNotificationLevel.Error);
+        return list.Except(refused).ToList();
+    }
+
+    internal static async Task LaunchUninstall(
+        IEnumerable<IPackage> packages,
+        bool? elevated = null,
+        bool? interactive = null,
+        bool? remove_data = null)
+    {
+        var list = ExcludeNonUninstallable(packages);
         if (list.Count == 0) return;
 
         foreach (var pkg in list)
@@ -371,6 +448,20 @@ public class InstalledPackagesPage : AbstractPackagesPage
             AvaloniaOperationRegistry.Add(op);
             _ = op.MainThread();
         }
+    }
+
+    internal static async Task LaunchUpdate(IPackage? package, bool? elevated = null)
+    {
+        // Updates must run on the upgradable instance: the installed one reports
+        // NewVersionString == VersionString, which managers read as "nothing to do".
+        if (package?.GetUpgradablePackage() is not { } upgradable) return;
+        var opts = await InstallOptionsFactory.LoadApplicableAsync(upgradable, elevated: elevated);
+        if (PackageOperation.HasPendingOperation(upgradable, OperationType.Update)) return;
+        var op = new UpdatePackageOperation(upgradable, opts);
+        op.OperationSucceeded += (_, _) => TelemetryHandler.UpdatePackage(upgradable, TEL_OP_RESULT.SUCCESS);
+        op.OperationFailed += (_, _) => TelemetryHandler.UpdatePackage(upgradable, TEL_OP_RESULT.FAILED);
+        AvaloniaOperationRegistry.Add(op);
+        _ = op.MainThread();
     }
 
     private static async Task LaunchReinstall(IPackage? package)
