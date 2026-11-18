@@ -21,6 +21,7 @@ public sealed class WinInstaller : PackageManager
 
         Capabilities = new ManagerCapabilities
         {
+            CanReinstallOnUpdate = true,
             CanRunAsAdmin = false,
             CanUninstall = true,
             InstalledPackagesKeepTheirSource = false,
@@ -29,6 +30,7 @@ public sealed class WinInstaller : PackageManager
             SupportsEmptySearchQuery = true,
             SupportsCustomPackageIcons = true,
             SupportsCustomVersions = true,
+            SupportsCustomVersionsOnUpdate = false,
             SerializesOperations = true,
             Sources = new SourceCapabilities
             {
@@ -45,6 +47,7 @@ public sealed class WinInstaller : PackageManager
         {
             Id = ManagerId,
             Name = "Installer",
+            SetupGuide = "WINDOWS_INSTALLER_FEEDS.md",
             DisplayName = "Installer packages",
             Description = CoreTools.Translate(
                 "Apps (.exe and .msi) that your organization publishes in its software catalog."

@@ -89,7 +89,8 @@ public partial class MainWindow
             new NativeMenuItemSeparator(),
             Item(CoreTools.Translate("UniGetUI Log"), navigate, "OwnLog"),
             Item(CoreTools.Translate("Package Manager logs"), navigate, "ManagerLog"),
-            Item(CoreTools.Translate("Operation history"), navigate, "OperationHistory"));
+            Item(CoreTools.Translate("Operation history"), navigate, "OperationHistory"),
+            Item(CoreTools.Translate("Manager health"), navigate, "ManagerHealth"));
 
         _macViewMenu = view.Menu;
         sidebar.PropertyChanged += (_, e) =>
@@ -188,6 +189,11 @@ public partial class MainWindow
         PageType.Bundles => CoreTools.Translate("Package Bundles"),
         PageType.CatalogEditor => CoreTools.Translate("Catalog Editor"),
         PageType.GitRepositories => CoreTools.Translate("Git Repositories"),
+        PageType.AgentSkills => CoreTools.Translate("Agent Skills"),
+        PageType.Drivers => CoreTools.Translate("Drivers"),
+#if UNIGETUI_XCODE_EXTENSION
+        PageType.Xcode => CoreTools.Translate("Xcode"),
+#endif
         PageType.Managers => CoreTools.Translate("Package Managers"),
         _ => CoreTools.Translate("Settings"),
     };

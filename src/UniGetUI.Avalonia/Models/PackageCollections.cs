@@ -198,6 +198,7 @@ public sealed class PackageWrapper : INotifyPropertyChanged, IDisposable, IPacka
     }
 
     public string VersionComboString { get; }
+    public string CardVersionString { get; }
     public string ListedNameTooltip { get; private set; } = "";
     public float ListedOpacity { get; private set; } = 1.0f;
     public string TagBackdropIconPath { get; private set; } = "";
@@ -206,6 +207,11 @@ public sealed class PackageWrapper : INotifyPropertyChanged, IDisposable, IPacka
 
     public bool InstallerHostChanged { get; private set; }
     public string InstallerHostChangeTooltip { get; private set; } = "";
+
+    public bool RequiresReinstallToUpdate => Package.RequiresReinstallToUpdate;
+    public bool ShowsNewVersionIcon => !InstallerHostChanged && !RequiresReinstallToUpdate;
+    public bool ShowsReinstallIcon => RequiresReinstallToUpdate && !InstallerHostChanged;
+    public string? ReinstallTooltip { get; }
 
     public bool InstalledVersionIsUnverified => Package.InstalledVersionIsUnverified;
     public string? InstalledVersionTooltip { get; private set; }
@@ -219,7 +225,11 @@ public sealed class PackageWrapper : INotifyPropertyChanged, IDisposable, IPacka
             : VersionComboString;
 
     public string NewVersionAutomationName =>
-        WithInstallerHostWarning(Package.NewVersionString);
+        WithInstallerHostWarning(
+            ReinstallTooltip is { } reinstall
+                ? $"{Package.NewVersionString}, {reinstall}"
+                : Package.NewVersionString
+        );
 
     public string InstallerHostAutomationName =>
         WithInstallerHostWarning(InstallerHostText);
@@ -261,7 +271,17 @@ public sealed class PackageWrapper : INotifyPropertyChanged, IDisposable, IPacka
         Package = package;
         _page = page;
         VersionComboString = package.VersionString;
+        CardVersionString = package.IsUpgradable
+            && !string.IsNullOrWhiteSpace(package.NewVersionString)
+            && package.NewVersionString != package.VersionString
+            ? $"{package.VersionString} → {package.NewVersionString}"
+            : package.VersionString;
         InstalledVersionTooltip = InstalledVersionNotice.BuildTooltip(package);
+        ReinstallTooltip = package.RequiresReinstallToUpdate
+            ? CoreTools.Translate(
+                "This version is installed differently from the one you have, so updating it uninstalls the current version first. Automatic updates and Update all leave it out unless \"Uninstall, then reinstall when updated\" is turned on for this package."
+            )
+            : null;
 
         Package.PropertyChanged += Package_PropertyChanged;
         UpdateDisplayState();
@@ -791,6 +811,14 @@ public sealed class PackageWrapper : INotifyPropertyChanged, IDisposable, IPacka
                     PropertyChanged?.Invoke(
                         this,
                         new PropertyChangedEventArgs(nameof(InstallerHostChangeTooltip))
+                    );
+                    PropertyChanged?.Invoke(
+                        this,
+                        new PropertyChangedEventArgs(nameof(ShowsNewVersionIcon))
+                    );
+                    PropertyChanged?.Invoke(
+                        this,
+                        new PropertyChangedEventArgs(nameof(ShowsReinstallIcon))
                     );
                     PropertyChanged?.Invoke(
                         this,

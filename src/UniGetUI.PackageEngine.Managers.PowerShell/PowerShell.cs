@@ -25,6 +25,7 @@ namespace UniGetUI.PackageEngine.Managers.PowerShellManager
                 CanRunAsAdmin = true,
                 CanSkipIntegrityChecks = true,
                 SupportsCustomVersions = true,
+                SupportsCustomVersionsOnUpdate = false,
                 CanDownloadInstaller = true,
                 SupportsReleaseNotes = true,
                 SupportsCustomScopes = true,
@@ -49,6 +50,7 @@ namespace UniGetUI.PackageEngine.Managers.PowerShellManager
             {
                 Id = "winps",
                 Name = "PowerShell",
+                SetupGuide = "PACKAGE_MANAGERS.md#powershell-5x",
                 DisplayName = "PowerShell 5.x",
                 Description = CoreTools.Translate(
                     "PowerShell's package manager. Find libraries and scripts to expand PowerShell capabilities<br>Contains: <b>Modules, Scripts, Cmdlets</b>"

@@ -14,6 +14,7 @@ using UniGetUI.Interface.Telemetry;
 using UniGetUI.PackageEngine;
 using UniGetUI.PackageEngine.Enums;
 using UniGetUI.PackageEngine.Interfaces;
+using UniGetUI.PackageEngine.ManagerClasses.Classes;
 using UniGetUI.PackageEngine.Operations;
 using UniGetUI.PackageEngine.PackageClasses;
 using UniGetUI.PackageEngine.PackageLoader;
@@ -42,10 +43,13 @@ internal static class AvaloniaPackageOperationHelper
         IReadOnlyList<IPackage> packages, bool background = false)
     {
         List<AbstractOperation> started = [];
-        foreach (var pkg in packages)
+        foreach (var listed in packages)
         {
+            var pkg = await UpgradablePackagesLoader.Instance.ResolveSkippedMajorUpdateAsync(listed);
+            if (pkg is null) continue;
             var opts = await InstallOptionsFactory.LoadApplicableAsync(pkg);
             if (PackageOperation.HasPendingOperation(pkg, OperationType.Update)) continue;
+            if (PackageOperation.IsLeftOutOfBulkUpdates(pkg, opts)) continue;
             var op = new UpdatePackageOperation(pkg, opts) { IsBackgroundOperation = background };
             op.OperationSucceeded += (_, _) => TelemetryHandler.UpdatePackage(pkg, TEL_OP_RESULT.SUCCESS);
             op.OperationFailed += (_, _) => TelemetryHandler.UpdatePackage(pkg, TEL_OP_RESULT.FAILED);
@@ -59,12 +63,15 @@ internal static class AvaloniaPackageOperationHelper
 
     public static async Task UpdateForIdAsync(string packageId)
     {
-        var pkg = UpgradablePackagesLoader.Instance.Packages.FirstOrDefault(p => p.Id == packageId);
-        if (pkg is null)
+        var listed = UpgradablePackagesLoader.Instance.Packages.FirstOrDefault(p => p.Id == packageId);
+        if (listed is null)
         {
             Logger.Warn($"BackgroundApi: no upgradable package found with id={packageId}");
             return;
         }
+
+        var pkg = await UpgradablePackagesLoader.Instance.ResolveSkippedMajorUpdateAsync(listed);
+        if (pkg is null) return;
 
         var opts = await InstallOptionsFactory.LoadApplicableAsync(pkg);
         if (PackageOperation.HasPendingOperation(pkg, OperationType.Update)) return;
@@ -247,58 +254,34 @@ internal static class AvaloniaPackageOperationHelper
     [System.Runtime.Versioning.SupportedOSPlatform("windows")]
     public static async Task HandleBrokenWinGetAsync()
     {
-        var banner = (MainWindow.Instance?.DataContext as MainWindowViewModel)?.WinGetWarningBanner;
+        var banner = (MainWindow.Instance?.DataContext as MainWindowViewModel)?.ManagerHealthBanner;
+        bool bannerWasOpen = banner?.IsOpen is true;
         banner?.IsOpen = false;
 
         try
         {
-            using var p = new Process
-            {
-                StartInfo = new ProcessStartInfo
-                {
-                    FileName = CoreData.PowerShell5,
-                    Arguments =
-                        "-ExecutionPolicy Bypass -NoLogo -NoProfile -Command \"& {"
-                        + "cmd.exe /C \"rmdir /Q /S `\"%temp%\\WinGet`\"\"; "
-                        + "cmd.exe /C \"`\"%localappdata%\\Microsoft\\WindowsApps\\winget.exe`\" source reset --force\"; "
-                        + "taskkill /im winget.exe /f; "
-                        + "taskkill /im WindowsPackageManagerServer.exe /f; "
-                        + "Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force; "
-                        + "Install-Module Microsoft.WinGet.Client -Force -AllowClobber; "
-                        + "Import-Module Microsoft.WinGet.Client; "
-                        + "Repair-WinGetPackageManager -Force -Latest; "
-                        + "Get-AppxPackage -Name 'Microsoft.DesktopAppInstaller' | Reset-AppxPackage; "
-                        + "}\"",
-                    UseShellExecute = true,
-                    Verb = "runas",
-                },
-            };
-
-            p.Start();
-            await p.WaitForExitAsync();
-
-            if (string.Equals(
-                Settings.GetValue(Settings.K.WinGetCliToolPreference),
-                "pinget",
-                StringComparison.OrdinalIgnoreCase))
-            {
-                Settings.SetValue(Settings.K.WinGetCliToolPreference, "default");
-            }
+            var winget = PEInterface.Managers
+                .FirstOrDefault(manager => manager.Name.Equals("WinGet", StringComparison.OrdinalIgnoreCase));
+            var repair = winget?.FindAction("repair-winget");
+            if (winget is null || repair is null)
+                throw new InvalidOperationException(CoreTools.Translate("WinGet is not available on this system"));
+            await winget.RunAsync(repair);
 
             MainWindow.Instance?.ShowBanner(
                 CoreTools.Translate("WinGet was repaired successfully"),
                 CoreTools.Translate("It is recommended to restart UniGetUI after WinGet has been repaired"),
                 MainWindow.RuntimeNotificationLevel.Success);
 
-            _ = UpgradablePackagesLoader.Instance.ReloadPackages();
             _ = InstalledPackagesLoader.Instance.ReloadPackages();
+            _ = UpgradablePackagesLoader.Instance.ReloadPackages();
         }
         catch (Exception ex)
         {
             Logger.Error("An error occurred while trying to repair WinGet");
             Logger.Error(ex);
 
-            banner?.IsOpen = true;
+            if (bannerWasOpen && banner is not null)
+                banner.IsOpen = true;
 
             MainWindow.Instance?.ShowBanner(
                 CoreTools.Translate("WinGet could not be repaired"),
@@ -306,17 +289,5 @@ internal static class AvaloniaPackageOperationHelper
                     + " — " + ex.Message,
                 MainWindow.RuntimeNotificationLevel.Error);
         }
-    }
-
-    /// <summary>
-    /// Returns true when the WinGet manager is ready but loaded zero installed packages,
-    /// which is a strong signal that WinGet has malfunctioned.
-    /// </summary>
-    public static bool IsWinGetMalfunctioning()
-    {
-        var winget = PEInterface.Managers.FirstOrDefault(m => m.Name == "WinGet");
-        return winget is not null
-            && winget.IsReady()
-            && !InstalledPackagesLoader.Instance.Packages.Any(p => p.Manager == winget);
     }
 }

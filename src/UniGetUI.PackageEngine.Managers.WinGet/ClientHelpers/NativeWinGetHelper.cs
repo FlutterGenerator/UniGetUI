@@ -1,9 +1,11 @@
+using System.Collections.Concurrent;
 using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 using Microsoft.Management.Deployment;
 using Microsoft.Win32;
 using UniGetUI.Core.Classes;
 using UniGetUI.Core.Logging;
+using UniGetUI.Core.SettingsEngine;
 using UniGetUI.Core.Tools;
 using UniGetUI.PackageEngine.Classes.Manager;
 using UniGetUI.PackageEngine.Enums;
@@ -199,6 +201,102 @@ internal sealed class NativeWinGetHelper : IWinGetManagerHelper
                 new(PackageMatchField.Moniker, false, null),
             ];
 
+    internal readonly record struct NativeSearchMatchId(string CatalogName, string? Id);
+
+    internal readonly record struct NativeSearchResult(string Name, string Version);
+
+    internal static IReadOnlyList<int> SelectUniqueSearchMatches(
+        IReadOnlyList<NativeSearchMatchId> matches
+    )
+    {
+        List<int> selected = [];
+        HashSet<(string, string)> seen = [];
+        for (int index = 0; index < matches.Count; index++)
+        {
+            if (matches[index].Id is { } id && seen.Add((matches[index].CatalogName, id)))
+            {
+                selected.Add(index);
+            }
+        }
+
+        return selected;
+    }
+
+    internal sealed record ResolvedSearchMatch<TPackage>(
+        int FirstIndex,
+        string Id,
+        NativeSearchResult Result,
+        TPackage Package
+    );
+
+    internal sealed record SearchMatchResolution<TPackage>(
+        IReadOnlyList<ResolvedSearchMatch<TPackage>> Matches,
+        IReadOnlyList<Exception> Errors,
+        int ResultCount
+    );
+
+    internal static SearchMatchResolution<TPackage> ResolveSearchMatches<TPackage>(
+        IReadOnlyList<(string CatalogName, TPackage Package)> matches,
+        Func<TPackage, string> readId,
+        Func<TPackage, NativeSearchResult> readResult,
+        int parallelism,
+        CancellationToken cancellationToken
+    )
+    {
+        var ids = new NativeSearchMatchId[matches.Count];
+        var resolved = new NativeSearchResult?[matches.Count];
+        var errors = new Exception?[matches.Count];
+        ConcurrentDictionary<(string, string), int> resolvingIndex = new();
+        Parallel.For(
+            0,
+            matches.Count,
+            new ParallelOptions
+            {
+                MaxDegreeOfParallelism = parallelism,
+                CancellationToken = cancellationToken,
+            },
+            index =>
+            {
+                var (catalogName, package) = matches[index];
+                try
+                {
+                    string id = readId(package);
+                    ids[index] = new(catalogName, id);
+                    if (resolvingIndex.TryAdd((catalogName, id), index))
+                    {
+                        resolved[index] = readResult(package);
+                    }
+                }
+                catch (Exception e)
+                {
+                    if (ids[index].Id is null)
+                    {
+                        ids[index] = new(catalogName, null);
+                    }
+
+                    errors[index] = e;
+                }
+            }
+        );
+
+        List<ResolvedSearchMatch<TPackage>> results = [];
+        foreach (int firstIndex in SelectUniqueSearchMatches(ids))
+        {
+            NativeSearchMatchId match = ids[firstIndex];
+            int index = resolvingIndex[(match.CatalogName, match.Id!)];
+            if (resolved[index] is { } result)
+            {
+                results.Add(new(firstIndex, match.Id!, result, matches[index].Package));
+            }
+        }
+
+        return new(
+            results,
+            [.. errors.OfType<Exception>()],
+            resolvingIndex.Count + ids.Count(match => match.Id is null)
+        );
+    }
+
     public IReadOnlyList<Package> FindPackages_UnSafe(string query)
     {
         List<Package> packages = [];
@@ -281,6 +379,7 @@ internal sealed class NativeWinGetHelper : IWinGetManagerHelper
         Task.WhenAll(FindPackageTasks.Values.ToArray()).GetAwaiter().GetResult();
         logger.Log($"All catalogs fetched. Fetching results for query piece {query}");
 
+        List<(IManagerSource Source, CatalogPackage NativePackage)> matches = [];
         foreach (var CatalogTaskPair in FindPackageTasks)
         {
             try
@@ -295,24 +394,7 @@ internal sealed class NativeWinGetHelper : IWinGetManagerHelper
                     MatchResult matchResult in NativeWinGetCollection.Copy(FoundPackages.Matches)
                 )
                 {
-                    CatalogPackage nativePackage = matchResult.CatalogPackage;
-                    // Create the Package item and add it to the list
-                    logger.Log(
-                        $"Found package: {nativePackage.Name}|{nativePackage.Id}|{nativePackage.DefaultInstallVersion.Version} on catalog {source.Name}"
-                    );
-
-                    var overriden_options = new OverridenInstallationOptions();
-
-                    var UniGetUIPackage = new Package(
-                        nativePackage.Name,
-                        nativePackage.Id,
-                        nativePackage.DefaultInstallVersion.Version,
-                        source,
-                        Manager,
-                        overriden_options
-                    );
-                    NativePackageHandler.AddPackage(UniGetUIPackage, nativePackage);
-                    packages.Add(UniGetUIPackage);
+                    matches.Add((source, matchResult.CatalogPackage));
                 }
             }
             catch (Exception e)
@@ -326,9 +408,57 @@ internal sealed class NativeWinGetHelper : IWinGetManagerHelper
             }
         }
 
-        logger.Close(0);
+        SearchMatchResolution<CatalogPackage> resolution;
+        try
+        {
+            resolution = ResolveSearchMatches(
+                [.. matches.Select(match => (match.Source.Name, match.NativePackage))],
+                nativePackage => nativePackage.Id,
+                nativePackage =>
+                    new(nativePackage.Name, nativePackage.DefaultInstallVersion.Version),
+                SearchVersionResolutionParallelism,
+                Manager.CurrentListingCancellation
+            );
+        }
+        catch (OperationCanceledException)
+        {
+            logger.Error("WinGet: The search was cancelled before its results were read.");
+            logger.Close(1);
+            throw;
+        }
+
+        if (resolution.Errors.Count > 0)
+        {
+            logger.Error(
+                $"WinGet: {resolution.Errors.Count} of {resolution.ResultCount} search results could not be read. First error:"
+            );
+            logger.Error(resolution.Errors[0]);
+        }
+
+        foreach (var match in resolution.Matches)
+        {
+            IManagerSource source = matches[match.FirstIndex].Source;
+            logger.Log(
+                $"Found package: {match.Result.Name}|{match.Id}|{match.Result.Version} on catalog {source.Name}"
+            );
+
+            var UniGetUIPackage = new Package(
+                match.Result.Name,
+                match.Id,
+                match.Result.Version,
+                source,
+                Manager,
+                new OverridenInstallationOptions()
+            );
+            NativePackageHandler.AddSearchResult(UniGetUIPackage, match.Package);
+            packages.Add(UniGetUIPackage);
+        }
+
+        logger.Close(packages.Count == 0 && resolution.Errors.Count > 0 ? 1 : 0);
         return packages;
     }
+
+    private const int SearchVersionResolutionParallelism = 8;
 
     public IReadOnlyList<Package> GetAvailableUpdates_UnSafe()
     {
@@ -344,12 +474,30 @@ internal sealed class NativeWinGetHelper : IWinGetManagerHelper
         }
 
         List<Package> packages = [];
+        List<(CatalogPackage Package, PackageVersionInfo Newest)> reinstallCandidates = [];
+        Lazy<IReadOnlyList<InstalledEntry>> installedEntries = new(() => ReadInstalledEntries(nativePackages));
         foreach (var nativePackage in nativePackages)
         {
             try
             {
                 if (!nativePackage.IsUpdateAvailable)
                 {
+                    if (
+                        Manager.GetLauncherGameSource(nativePackage.InstalledVersion?.Id) is null
+                        && TryGetReinstallOnlyUpdate(nativePackage, logger) is { } newest
+                    )
+                    {
+                        reinstallCandidates.Add((nativePackage, newest));
+                    }
+
+                    continue;
+                }
+
+                if (Manager.GetLauncherGameSource(nativePackage.InstalledVersion.Id) is { } launcherGameSource)
+                {
+                    logger.Log(
+                        $"Skipping the update of {nativePackage.Id}, since it was installed by {launcherGameSource.Name}"
+                    );
                     continue;
                 }
 
@@ -366,6 +514,18 @@ internal sealed class NativeWinGetHelper : IWinGetManagerHelper
                     Logger.Warn(
                         $"WinGet package {nativePackage.Id} has a DefaultInstallVersion with null PackageCatalog or Info, skipping"
                     );
+                    continue;
+                }
+
+                if (
+                    IsSupersededByAnotherInstall(
+                        nativePackage,
+                        nativePackage.DefaultInstallVersion.Version,
+                        installedEntries.Value,
+                        logger
+                    )
+                )
+                {
                     continue;
                 }
 
@@ -415,8 +575,255 @@ internal sealed class NativeWinGetHelper : IWinGetManagerHelper
             }
         }
 
+        AddReinstallOnlyUpdates(
+            [
+                .. reinstallCandidates.Where(candidate =>
+                    !IsSupersededByAnotherInstall(
+                        candidate.Package,
+                        candidate.Newest.Version,
+                        installedEntries.Value,
+                        logger
+                    )
+                ),
+            ],
+            packages,
+            logger
+        );
+
         logger.Close(0);
         return packages;
+    }
+
+    internal readonly record struct InstalledEntry(string DisplayName, string Publisher, string Version);
+
+    private static IReadOnlyList<InstalledEntry> ReadInstalledEntries(
+        IReadOnlyList<CatalogPackage> nativePackages
+    )
+    {
+        List<InstalledEntry> entries = [];
+        foreach (var nativePackage in nativePackages)
+        {
+            if (ReadInstalledEntry(nativePackage) is { } entry)
+                entries.Add(entry);
+        }
+
+        return entries;
+    }
+
+    private static InstalledEntry? ReadInstalledEntry(CatalogPackage nativePackage)
+    {
+        try
+        {
+            return nativePackage.InstalledVersion is { } installed
+                ? new InstalledEntry(
+                    installed.DisplayName ?? "",
+                    installed.Publisher ?? "",
+                    installed.Version ?? ""
+                )
+                : null;
+        }
+        catch (Exception ex)
+        {
+            Logger.Debug(
+                $"Could not read the installed entry of {DescribePackage(nativePackage)}: {ex.Message}"
+            );
+            return null;
+        }
+    }
+
+    private bool IsSupersededByAnotherInstall(
+        CatalogPackage nativePackage,
+        string? newVersion,
+        IReadOnlyList<InstalledEntry> installedEntries,
+        INativeTaskLogger logger
+    )
+    {
+        if (
+            ReadInstalledEntry(nativePackage) is not { } candidate
+            || FindInstallAtOrAbove(Manager, candidate, newVersion, installedEntries) is not { } newer
+        )
+        {
+            return false;
+        }
+
+        logger.Log(
+            $"Skipping the update of {DescribePackage(nativePackage)} from {candidate.Version} to {newVersion}, "
+                + $"since {newer.DisplayName} {newer.Version} from {newer.Publisher} is already installed"
+        );
+        return true;
+    }
+
+    internal static InstalledEntry? FindInstallAtOrAbove(
+        IPackageManager manager,
+        InstalledEntry candidate,
+        string? newVersion,
+        IEnumerable<InstalledEntry> installedEntries
+    )
+    {
+        if (
+            string.IsNullOrWhiteSpace(candidate.DisplayName)
+            || string.IsNullOrWhiteSpace(candidate.Publisher)
+            || WinGetPkgOperationHelper.IsUnknownVersion(newVersion)
+        )
+        {
+            return null;
+        }
+
+        foreach (var entry in installedEntries)
+        {
+            if (
+                string.Equals(entry.DisplayName, candidate.DisplayName, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(entry.Publisher, candidate.Publisher, StringComparison.OrdinalIgnoreCase)
+                && !WinGetPkgOperationHelper.IsUnknownVersion(entry.Version)
+                && manager.CompareVersions(entry.Version, newVersion!) is >= 0
+            )
+            {
+                return entry;
+            }
+        }
+
+        return null;
+    }
+
+    private PackageVersionInfo? TryGetReinstallOnlyUpdate(CatalogPackage nativePackage, INativeTaskLogger logger)
+    {
+        try
+        {
+            PackageVersionInfo? installed = nativePackage.InstalledVersion;
+            var availableVersions = nativePackage.AvailableVersions;
+            if (installed is null || availableVersions is null)
+                return null;
+
+            string installedChannel = installed.Channel ?? "";
+            PackageVersionId? newestId = null;
+            for (int i = 0; i < availableVersions.Count; i++)
+            {
+                if (string.Equals(availableVersions[i].Channel ?? "", installedChannel, StringComparison.OrdinalIgnoreCase))
+                {
+                    newestId = availableVersions[i];
+                    break;
+                }
+            }
+
+            if (newestId is null || !IsNewerVersion(Manager, installed.Version, newestId.Version))
+                return null;
+
+            PackageVersionInfo newest = nativePackage.GetPackageVersionInfo(newestId);
+            if (newest?.PackageCatalog?.Info is null)
+                return null;
+
+            if (!IsSamePackage(nativePackage.Id, newest.Id))
+            {
+                logger.Log(
+                    $"Not listing {DescribePackage(nativePackage)} as an update that needs a reinstall: its newest version {newest.Version} "
+                        + $"belongs to {newest.Id} on {newest.PackageCatalog.Info.Name}, not to {nativePackage.Id}"
+                );
+                return null;
+            }
+
+            return newest.GetApplicableInstaller(Factory.CreateInstallOptions()) is null ? null : newest;
+        }
+        catch (Exception ex)
+        {
+            Logger.Debug(
+                $"Could not check whether {DescribePackage(nativePackage)} has an update that needs a reinstall: {ex.Message}"
+            );
+            return null;
+        }
+    }
+
+    private static IEnumerable<string?> GetPinIdentifiers(CatalogPackage nativePackage)
+    {
+        yield return nativePackage.Id;
+        if (nativePackage.InstalledVersion is not { } installed)
+            yield break;
+
+        yield return installed.Id;
+        foreach (string productCode in NativeWinGetCollection.Copy(installed.ProductCodes))
+            yield return productCode;
+        foreach (string familyName in NativeWinGetCollection.Copy(installed.PackageFamilyNames))
+            yield return familyName;
+    }
+
+    internal static bool IsSamePackage(string? listedId, string? newestId) =>
+        !string.IsNullOrWhiteSpace(listedId)
+        && string.Equals(listedId, newestId, StringComparison.OrdinalIgnoreCase);
+
+    internal static bool IsNewerVersion(IPackageManager manager, string? installedVersion, string? newestVersion) =>
+        !WinGetPkgOperationHelper.IsUnknownVersion(installedVersion)
+        && !string.IsNullOrWhiteSpace(newestVersion)
+        && manager.CompareVersions(installedVersion!, newestVersion) is < 0;
+
+    private void AddReinstallOnlyUpdates(
+        List<(CatalogPackage Package, PackageVersionInfo Newest)> candidates,
+        List<Package> packages,
+        INativeTaskLogger logger
+    )
+    {
+        if (candidates.Count == 0)
+            return;
+
+        if (Settings.Get(Settings.K.UseAgentBroker))
+        {
+            logger.Log(
+                "Updates that need a reinstall are not listed while operations go through the Devolutions Agent"
+            );
+            return;
+        }
+
+        IReadOnlyList<string>? pinnedIds = WinGetPins.Read(Manager);
+        if (pinnedIds is null)
+        {
+            logger.Error(
+                "Could not read the WinGet pins, so updates that need a reinstall are not listed"
+            );
+            return;
+        }
+
+        foreach (var (nativePackage, newest) in candidates)
+        {
+            try
+            {
+                if (WinGetPins.IsPinned(pinnedIds, GetPinIdentifiers(nativePackage)))
+                    continue;
+
+                IManagerSource source = Manager.SourcesHelper.Factory.GetSourceOrDefault(
+                    newest.PackageCatalog.Info.Name
+                );
+                string? reportedVersion = nativePackage.InstalledVersion.Version;
+                var package = new Package(
+                    nativePackage.Name,
+                    nativePackage.Id,
+                    WinGetPkgOperationHelper.ResolveReportedInstalledVersion(
+                        nativePackage.Id,
+                        reportedVersion
+                    ),
+                    newest.Version,
+                    source,
+                    Manager
+                )
+                {
+                    InstalledVersionIsUnverified = WinGetPkgOperationHelper.IsUnknownVersion(
+                        reportedVersion
+                    ),
+                    RequiresReinstallToUpdate = true,
+                };
+
+                if (WinGetPkgOperationHelper.IsStuckUpgradeLoop(package))
+                    continue;
+
+                NativePackageHandler.AddPackage(package, nativePackage);
+                NativePackageHandler.AddLocalIdentifier(package, nativePackage.InstalledVersion?.Id);
+                packages.Add(package);
+                logger.Log(
+                    $"Found package {nativePackage.Name} {nativePackage.Id} on source {source.Name}, from version {package.VersionString} to version {newest.Version}, which needs a reinstall"
+                );
+            }
+            catch (Exception ex)
+            {
+                LogSkippedPackage(logger, nativePackage, "listing updates that need a reinstall", ex);
+            }
+        }
     }
 
     public IReadOnlyList<Package> GetInstalledPackages_UnSafe()
@@ -437,12 +844,19 @@ internal sealed class NativeWinGetHelper : IWinGetManagerHelper
         {
             try
             {
+                string id = nativePackage.Id;
+                string? localIdentifier = nativePackage.InstalledVersion.Id;
                 IManagerSource source;
                 var availableVersions =
                     nativePackage.AvailableVersions is { } versions
                         ? NativeWinGetCollection.Copy(versions)
                         : [];
-                if (availableVersions.Length > 0)
+                if (Manager.GetLauncherGameSource(localIdentifier) is { } launcherGameSource)
+                {
+                    id = localIdentifier!;
+                    source = launcherGameSource;
+                }
+                else if (availableVersions.Length > 0)
                 {
                     var installPackage = nativePackage.GetPackageVersionInfo(availableVersions[0]);
                     source = Manager.SourcesHelper.Factory.GetSourceOrDefault(
@@ -456,16 +870,16 @@ internal sealed class NativeWinGetHelper : IWinGetManagerHelper
 
                 string? reportedVersion = nativePackage.InstalledVersion.Version;
                 string version = WinGetPkgOperationHelper.ResolveReportedInstalledVersion(
-                    nativePackage.Id,
+                    id,
                     reportedVersion
                 );
 
                 logger.Log(
-                    $"Found package {nativePackage.Name} {nativePackage.Id} on source {source.Name}"
+                    $"Found package {nativePackage.Name} {id} on source {source.Name}"
                 );
                 var UniGetUIPackage = new Package(
                     nativePackage.Name,
-                    nativePackage.Id,
+                    id,
                     version,
                     source,
                     Manager
@@ -849,7 +1263,7 @@ internal sealed class NativeWinGetHelper : IWinGetManagerHelper
         {
             details.ManifestUrl = new Uri(
                 "https://github.com/microsoft/winget-pkgs/tree/master/manifests/"
-                    + details.Package.Id[0].ToString().ToLower()
+                    + details.Package.Id[0].ToString().ToLowerInvariant()
                     + "/"
                     + details.Package.Id.Split('.')[0]
                     + "/"

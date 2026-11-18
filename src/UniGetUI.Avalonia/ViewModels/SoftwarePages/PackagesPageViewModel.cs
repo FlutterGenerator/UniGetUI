@@ -80,6 +80,10 @@ public class SourceTreeNode : INotifyPropertyChanged
     public string? PackageID { get; init; }
     public string? Version { get; init; }
     public string? Source { get; init; }
+
+    /// <summary>Identifies the manager or source across rebuilds of the tree, to keep its selection.</summary>
+    public string? SelectionKey { get; init; }
+
     public AvaloniaList<SourceTreeNode> Children { get; }
 
     public bool HasChildren => Children.Count > 0;
@@ -246,6 +250,7 @@ public partial class PackagesPageViewModel : ViewModelBase
     [ObservableProperty] private bool _installerHostColumnVisible;
     [ObservableProperty] private bool _downloadSizeColumnVisible;
     [ObservableProperty] private bool _releaseDateColumnVisible;
+    [ObservableProperty] private bool _columnsFitToWindow;
     [ObservableProperty] private bool _reloadButtonVisible;
     [ObservableProperty] private string _reloadButtonTooltip = "";
     [ObservableProperty] private bool _isFilterPaneOpen;
@@ -290,6 +295,10 @@ public partial class PackagesPageViewModel : ViewModelBase
     private readonly SourceTreeNode _localPackagesNode = new() { PackageName = "local" };
     private bool _isSynchronizingSourceSelection;
 
+    // Discover keeps source selections across searches, including empty-query searches.
+    private bool _browsing;
+    private readonly Dictionary<string, bool> _rememberedSourceSelection = new(StringComparer.Ordinal);
+
     // ─── Events (replace abstract methods) ───────────────────────────────────
     public event Action<ReloadReason>? PackagesLoaded;
     public event Action? PackageCountUpdated;
@@ -325,8 +334,8 @@ public partial class PackagesPageViewModel : ViewModelBase
         SimilarSearchEnabled = !data.DisableSuggestedResultsRadio;
         RoleIsUpdateLike = data.PageRole == OperationType.Update;
         OptionalColumnsAvailable = data.PageRole != OperationType.Uninstall;
-        LoadColumnVisibility();
-        ColumnVisibilityChanged += LoadColumnVisibility;
+        LoadColumnLayout();
+        ColumnLayoutChanged += LoadColumnLayout;
         ReloadButtonVisible = !DisableReload;
         SearchBoxPlaceholder = CoreTools.Translate("Search for packages");
 
@@ -698,6 +707,7 @@ public partial class PackagesPageViewModel : ViewModelBase
             {
                 MegaQueryText = "";
                 MegaQueryVisible = true;
+                _browsing = false;
                 if (Loader is DiscoverablePackagesLoader discoverLoader)
                     discoverLoader.ResetSearch();
                 else
@@ -725,7 +735,13 @@ public partial class PackagesPageViewModel : ViewModelBase
     [RelayCommand]
     public void SubmitSearch()
     {
-        string query = _searchQuery = GlobalQueryText = MegaQueryText.Trim();
+        string query = MegaQueryText.Trim();
+
+        // Empty queries browse the selected managers that support them.
+        bool browse = Loader is DiscoverablePackagesLoader && query.Length == 0;
+
+        _browsing = browse;
+        _searchQuery = GlobalQueryText = query;
         MegaQueryVisible = false;
 
         if (Loader is DiscoverablePackagesLoader discoverLoader)
@@ -801,7 +817,7 @@ public partial class PackagesPageViewModel : ViewModelBase
         }
         else if (FilteredPackages.Count == 0)
         {
-            bool noQuery = string.IsNullOrWhiteSpace(query);
+            bool noQuery = string.IsNullOrWhiteSpace(query) && !_browsing;
             bool noManagerReady = noQuery && IsWithoutReadyManager;
             BackgroundText = noManagerReady
                 ? CoreTools.Translate("No package managers are available")
@@ -869,12 +885,12 @@ public partial class PackagesPageViewModel : ViewModelBase
     public const string DownloadSizeColumn = "DownloadSize";
     public const string ReleaseDateColumn = "ReleaseDate";
 
-    private static event Action? ColumnVisibilityChanged;
+    private static event Action? ColumnLayoutChanged;
 
     private static bool ColumnHidden(string column)
         => Settings.GetDictionaryItem<string, bool>(Settings.K.HiddenPackageListColumns, column);
 
-    private void LoadColumnVisibility()
+    public void LoadColumnLayout()
     {
         NameColumnVisible = !ColumnHidden(NameColumn);
         IdColumnVisible = !ColumnHidden(IdColumn);
@@ -887,6 +903,13 @@ public partial class PackagesPageViewModel : ViewModelBase
         if (!IdColumnVisible && !VersionColumnVisible && !NewVersionHeaderVisible && !SourceColumnVisible
             && !InstallerHostColumnVisible && !DownloadSizeColumnVisible && !ReleaseDateColumnVisible)
             NameColumnVisible = true;
+        ColumnsFitToWindow = !Settings.Get(Settings.K.DisablePackageListColumnAutoFit);
+    }
+
+    public static void SetColumnsFitToWindow(bool fit)
+    {
+        Settings.Set(Settings.K.DisablePackageListColumnAutoFit, !fit);
+        ColumnLayoutChanged?.Invoke();
     }
 
     public static void SetColumnVisible(string column, bool visible)
@@ -907,7 +930,7 @@ public partial class PackagesPageViewModel : ViewModelBase
                 else Settings.SetDictionaryItem(Settings.K.HiddenPackageListColumns, column, true);
                 break;
         }
-        ColumnVisibilityChanged?.Invoke();
+        ColumnLayoutChanged?.Invoke();
     }
 
     partial void OnDownloadSizeColumnVisibleChanged(bool value)
@@ -968,23 +991,32 @@ public partial class PackagesPageViewModel : ViewModelBase
     }
 
     // ─── Sources ──────────────────────────────────────────────────────────────
-    public void AddPackageToSourcesList(IPackage package)
+    public void AddPackageToSourcesList(IPackage package) => AddSourceToSourcesList(package.Source, package);
+
+    private void AddSourceToSourcesList(IManagerSource source, IPackage? package = null)
     {
-        IManagerSource source = package.Source;
         if (!UsedManagers.Contains(source.Manager))
         {
             UsedManagers.Add(source.Manager);
             var node = new SourceTreeNode
             {
                 PackageName = source.Manager.DisplayName,
-                PackageID = package.Id,
-                Version = package.VersionString,
-                Source = package.Source.Name
+                PackageID = package?.Id,
+                Version = package?.VersionString,
+                Source = source.Name,
+                SelectionKey = source.Manager.Name,
             };
 
-            var existing = GetAllSourceNodes();
-            if (existing.Count == 0 || existing.Count(n => n.IsSelected) >= existing.Count / 2)
-                node.IsSelected = true;
+            if (RememberedSelection(node.SelectionKey) is { } remembered)
+            {
+                node.IsSelected = remembered;
+            }
+            else
+            {
+                var existing = GetAllSourceNodes();
+                if (existing.Count == 0 || existing.Count(n => n.IsSelected) >= existing.Count / 2)
+                    node.IsSelected = true;
+            }
 
             AddRootSourceNode(node);
             RootNodeForManager.TryAdd(source.Manager, node);
@@ -1001,15 +1033,16 @@ public partial class PackagesPageViewModel : ViewModelBase
             var item = new SourceTreeNode
             {
                 PackageName = source.Name,
-                PackageID = package.Id,
-                Version = package.VersionString,
-                Source = package.Source.Name
+                PackageID = package?.Id,
+                Version = package?.VersionString,
+                Source = source.Name,
+                SelectionKey = $"{source.Manager.Name}\n{source.Name}",
             };
             NodesForSources.TryAdd(source, item);
 
             if (source.IsVirtualManager)
             {
-                item.IsSelected = _localPackagesNode.IsSelected;
+                item.IsSelected = RememberedSelection(item.SelectionKey) ?? _localPackagesNode.IsSelected;
                 item.PropertyChanged += OnRootSourceNodePropertyChanged;
                 _localPackagesNode.Children.Add(item);
                 if (!GetAllSourceNodes().Contains(_localPackagesNode))
@@ -1021,12 +1054,16 @@ public partial class PackagesPageViewModel : ViewModelBase
             else
             {
                 var rootNode = RootNodeForManager[source.Manager];
-                item.IsSelected = rootNode.IsSelected;
+                item.IsSelected = RememberedSelection(item.SelectionKey) ?? rootNode.IsSelected;
                 item.PropertyChanged += OnRootSourceNodePropertyChanged;
                 rootNode.Children.Add(item);
             }
         }
     }
+
+    // Only Discover remembers: a search there rebuilds the tree from its results
+    private bool? RememberedSelection(string key) =>
+        MegaQueryBoxEnabled && _rememberedSourceSelection.TryGetValue(key, out bool selected) ? selected : null;
 
     public void ClearSourcesList()
     {
@@ -1042,6 +1079,14 @@ public partial class PackagesPageViewModel : ViewModelBase
         RootNodeForManager.Clear();
         NodesForSources.Clear();
         _localPackagesNode.Children.Clear();
+
+        // Discover shows its placeholder again until sources are added, as a search that found
+        // nothing, or a browse with no source to list, leaves none
+        if (MegaQueryBoxEnabled)
+        {
+            SourcesPlaceholderVisible = true;
+            SourcesTreeVisible = false;
+        }
     }
 
     private void AddRootSourceNode(SourceTreeNode node)
@@ -1054,6 +1099,9 @@ public partial class PackagesPageViewModel : ViewModelBase
     {
         if (e.PropertyName == nameof(SourceTreeNode.IsSelected))
         {
+            if (MegaQueryBoxEnabled && sender is SourceTreeNode { SelectionKey: { } key } changed)
+                _rememberedSourceSelection[key] = changed.IsSelected;
+
             if (sender is SourceTreeNode node && SourceNodes.Contains(node))
             {
                 _isSynchronizingSourceSelection = true;
@@ -1275,6 +1323,19 @@ public partial class PackagesPageViewModel : ViewModelBase
         if (LoadsOnStart && _lastLoadHadNoManagerReady && !Loader.IsLoading && !Loader.HasPendingInitialLoad
             && Loader.AnyManagerReady)
             _ = LoadPackages(ReloadReason.Automated);
+    }
+
+    public async Task ReloadAfterManagerExecutableChangedAsync()
+    {
+        if (!LoadsOnStart)
+            return;
+
+        if (Loader.IsLoading)
+            await Loader.WaitForCurrentLoadAsync();
+        else if (Loader.HasPendingInitialLoad)
+            return;
+
+        await Loader.ReloadPackages();
     }
 
     // ─── Sort commands ────────────────────────────────────────────────────────

@@ -6,7 +6,7 @@
         <ItemGroup>
             <Compile
                 Include="**/*$(DefaultLanguageSourceExtension)"
-                Exclude="$(DefaultItemExcludes);$(DefaultExcludesInProjectFolder);$(BaseIntermediateOutputPath)**;$(BaseOutputPath)**;@(Compile)"
+                Exclude="$(DefaultItemExcludes);$(DefaultExcludesInProjectFolder);$(BaseIntermediateOutputPath)**;$(BaseOutputPath)**;@(Compile);@(XcodeExcludedCompile)"
             />
         </ItemGroup>
     </Target>
@@ -282,13 +282,16 @@
         <PackageReference Include="Devolutions.AvaloniaTheme.Linux" Version="2026.3.11" Condition="$([MSBuild]::IsOSPlatform('Linux'))" />
         <PackageReference Include="AvaloniaUI.DiagnosticsSupport" Version="2.2.0-beta3" Condition="'$(EnableAvaloniaDiagnostics)' == 'true'" />
         <PackageReference Include="CommunityToolkit.Mvvm" Version="8.*" />
-        <PackageReference Include="Avalonia.Controls.WebView" Version="12.0.0" />
+        <PackageReference Include="Avalonia.Controls.WebView" Version="12.1.2" />
         <PackageReference Include="Tmds.DBus.Protocol" Version="0.92.0" />
         <PackageReference Include="Devolutions.UniGetUI.Elevator" Version="2.6.1.3" GeneratePathProperty="true" ExcludeAssets="build;buildTransitive;native" Condition="$([MSBuild]::IsOSPlatform('Windows'))" />
         <PackageReference Include="Devolutions.Pinget.Cli.Rust" Version="0.13.0" GeneratePathProperty="true" ExcludeAssets="build;buildTransitive;native" />
     </ItemGroup>
 
     <ItemGroup>
+        <ProjectReference Include="..\UniGetUI.AgentSkills.Cli\UniGetUI.AgentSkills.Cli.csproj" />
+        <ProjectReference Include="..\UniGetUI.Extensions.AgentSkills\UniGetUI.Extensions.AgentSkills.csproj" />
+        <ProjectReference Include="..\UniGetUI.Extensions.Drivers\UniGetUI.Extensions.Drivers.csproj" />
         <ProjectReference Include="..\UniGetUI.Core.Data\UniGetUI.Core.Data.csproj" />
         <ProjectReference Include="..\UniGetUI.Core.LanguageEngine\UniGetUI.Core.LanguageEngine.csproj" />
         <ProjectReference Include="..\UniGetUI.Core.Logger\UniGetUI.Core.Logging.csproj" />
@@ -296,6 +299,7 @@
         <ProjectReference Include="..\UniGetUI.Core.Settings\UniGetUI.Core.Settings.csproj" />
         <ProjectReference Include="..\UniGetUI.Core.Tools\UniGetUI.Core.Tools.csproj" />
         <ProjectReference Include="..\UniGetUI.Extensions.GitRepositories\UniGetUI.Extensions.GitRepositories.csproj" />
+        <ProjectReference Include="..\UniGetUI.Extensions.Xcode\UniGetUI.Extensions.Xcode.csproj" Condition="'$(EnableXcodeExtension)' == 'true'" />
         <ProjectReference Include="..\UniGetUI.Interface.Enums\UniGetUI.Interface.Enums.csproj" />
         <ProjectReference Include="..\UniGetUI.Interface.IpcApi\UniGetUI.Interface.IpcApi.csproj" />
         <ProjectReference Include="..\UniGetUI.Interface.Telemetry\UniGetUI.Interface.Telemetry.csproj" />
@@ -323,8 +327,6 @@
         <AvaloniaResource Include="Assets\Images\launcher.png" />
         <AvaloniaResource Include="Assets\Images\Trophee.png" />
         <AvaloniaResource Include="Assets\Images\Empty_inbox.png" />
-        <AvaloniaResource Include="..\SharedAssets\Assets\SplashScreen.png" Link="Assets\SplashScreen.png" />
-        <AvaloniaResource Include="..\SharedAssets\Assets\SplashScreen.theme-dark.png" Link="Assets\SplashScreen.theme-dark.png" />
         <!-- Tray status icon variants: status colour encoded by the corner dot; light/dark tone per taskbar theme. -->
         <AvaloniaResource Include="..\SharedAssets\Assets\Images\tray_empty_black_legacy.ico" Link="Assets\tray_empty_black_legacy.ico" />
         <AvaloniaResource Include="..\SharedAssets\Assets\Images\tray_empty_white_legacy.ico" Link="Assets\tray_empty_white_legacy.ico" />
@@ -354,6 +356,13 @@
       <!-- Style-only files have no x:Class; exclude from codegen and embed as plain resources -->
       <AvaloniaXaml Remove="Assets\Styles\*.axaml" />
       <AvaloniaResource Include="Assets\Styles\*.axaml" />
+    </ItemGroup>
+
+    <ItemGroup Condition="'$(EnableXcodeExtension)' != 'true'">
+      <XcodeExcludedCompile Include="Infrastructure\Xcode*.cs;ViewModels\Pages\Xcode*.cs;ViewModels\Pages\SettingsPages\XcodeSettingsViewModel.cs;Views\Controls\XcodeAccountCard.axaml.cs;Views\DialogPages\Xcode*.cs;Views\Pages\XcodePage.axaml.cs;Views\Pages\SettingsPages\XcodeSettings.axaml.cs" />
+      <Compile Remove="@(XcodeExcludedCompile)" />
+      <AvaloniaXaml Remove="Views\Controls\XcodeAccountCard.axaml;Views\Pages\XcodePage.axaml;Views\Pages\SettingsPages\XcodeSettings.axaml" />
+      <AvaloniaResource Remove="..\SharedAssets\Assets\Symbols\xcode.svg" />
     </ItemGroup>
 
     <ItemGroup>
@@ -399,9 +408,6 @@
       </Compile>
       <Compile Update="Views\MainWindow.axaml.cs">
         <DependentUpon>MainWindow.axaml</DependentUpon>
-      </Compile>
-      <Compile Update="Views\SplashWindow.axaml.cs">
-        <DependentUpon>SplashWindow.axaml</DependentUpon>
       </Compile>
       <Compile Update="Views\Pages\AbstractPackagesPage.axaml.cs">
         <DependentUpon>AbstractPackagesPage.axaml</DependentUpon>

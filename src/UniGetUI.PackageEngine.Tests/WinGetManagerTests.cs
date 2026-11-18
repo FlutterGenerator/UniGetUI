@@ -179,6 +179,203 @@ public sealed class WinGetManagerTests : IDisposable
     }
 
     [Fact]
+    public void SelectUniqueSearchMatchesKeepsTheFirstMatchOfEachPackageInOrder()
+    {
+        NativeWinGetHelper.NativeSearchMatchId[] matches =
+        [
+            new("winget", "Mozilla.Firefox"),
+            new("winget", "Contoso.Tool"),
+            new("winget", "Mozilla.Firefox"),
+            new("msstore", "Mozilla.Firefox"),
+            new("winget", "Contoso.Tool"),
+        ];
+
+        Assert.Equal([0, 1, 3], NativeWinGetHelper.SelectUniqueSearchMatches(matches));
+    }
+
+    [Fact]
+    public void SelectUniqueSearchMatchesSkipsUnreadableMatches()
+    {
+        NativeWinGetHelper.NativeSearchMatchId[] matches =
+        [
+            new("winget", null),
+            new("winget", "Contoso.Tool"),
+            new("winget", null),
+            new("winget", "Contoso.Other"),
+        ];
+
+        Assert.Equal([1, 3], NativeWinGetHelper.SelectUniqueSearchMatches(matches));
+    }
+
+    [Fact]
+    public void SelectUniqueSearchMatchesTreatsIdsWithDifferentCaseAsDifferentPackages()
+    {
+        NativeWinGetHelper.NativeSearchMatchId[] matches =
+        [
+            new("winget", "Contoso.Tool"),
+            new("winget", "contoso.tool"),
+        ];
+
+        Assert.Equal([0, 1], NativeWinGetHelper.SelectUniqueSearchMatches(matches));
+    }
+
+    private sealed class FakeSearchMatch(string id, string name, string version)
+    {
+        public string Id { get; } = id;
+        public string Name { get; } = name;
+        public string Version { get; } = version;
+        public Func<string>? ReadId { get; init; }
+        public Func<NativeWinGetHelper.NativeSearchResult>? ReadResult { get; init; }
+    }
+
+    private static NativeWinGetHelper.SearchMatchResolution<FakeSearchMatch> Resolve(
+        IReadOnlyList<(string CatalogName, FakeSearchMatch Package)> matches,
+        ConcurrentDictionary<FakeSearchMatch, int>? resultReads = null,
+        int parallelism = 8,
+        CancellationToken cancellationToken = default
+    ) =>
+        NativeWinGetHelper.ResolveSearchMatches(
+            matches,
+            match => match.ReadId?.Invoke() ?? match.Id,
+            match =>
+            {
+                resultReads?.AddOrUpdate(match, 1, (_, count) => count + 1);
+                return match.ReadResult?.Invoke() ?? new(match.Name, match.Version);
+            },
+            parallelism,
+            cancellationToken
+        );
+
+    [Fact]
+    public void ResolveSearchMatchesReadsMetadataOncePerPackageInFirstOccurrenceOrder()
+    {
+        var firefox = new FakeSearchMatch("Mozilla.Firefox", "Mozilla Firefox", "150.0");
+        var tool = new FakeSearchMatch("Contoso.Tool", "Contoso Tool", "1.0");
+        var firefoxById = new FakeSearchMatch("Mozilla.Firefox", "Mozilla Firefox", "150.0");
+        var storeFirefox = new FakeSearchMatch("Mozilla.Firefox", "Mozilla Firefox", "Unknown");
+        var toolByMoniker = new FakeSearchMatch("Contoso.Tool", "Contoso Tool", "1.0");
+        ConcurrentDictionary<FakeSearchMatch, int> reads = new();
+
+        var resolution = Resolve(
+            [
+                ("winget", firefox),
+                ("winget", tool),
+                ("winget", firefoxById),
+                ("msstore", storeFirefox),
+                ("winget", toolByMoniker),
+            ],
+            reads
+        );
+
+        Assert.Equal([0, 1, 3], resolution.Matches.Select(match => match.FirstIndex));
+        Assert.Equal(
+            ["Mozilla.Firefox", "Contoso.Tool", "Mozilla.Firefox"],
+            resolution.Matches.Select(match => match.Id)
+        );
+        Assert.Equal(["150.0", "1.0", "Unknown"], resolution.Matches.Select(match => match.Result.Version));
+        Assert.Equal(3, reads.Values.Sum());
+        Assert.All(reads.Values, count => Assert.Equal(1, count));
+        Assert.Equal(1, reads.Keys.Count(match => match == firefox || match == firefoxById));
+        Assert.Equal(1, reads.Keys.Count(match => match == tool || match == toolByMoniker));
+        Assert.Empty(resolution.Errors);
+        Assert.Equal(3, resolution.ResultCount);
+    }
+
+    [Fact]
+    public void ResolveSearchMatchesKeepsTheResolvingDuplicateAtTheFirstPosition()
+    {
+        using var laterDuplicateResolved = new ManualResetEventSlim();
+        var first = new FakeSearchMatch("Contoso.Tool", "Contoso Tool", "1.0")
+        {
+            ReadId = () =>
+            {
+                Assert.True(laterDuplicateResolved.Wait(TimeSpan.FromSeconds(10)));
+                return "Contoso.Tool";
+            },
+        };
+        var other = new FakeSearchMatch("Contoso.Other", "Contoso Other", "2.0");
+        var laterDuplicate = new FakeSearchMatch("Contoso.Tool", "Contoso Tool", "1.0")
+        {
+            ReadResult = () =>
+            {
+                laterDuplicateResolved.Set();
+                return new("Contoso Tool", "1.0");
+            },
+        };
+        ConcurrentDictionary<FakeSearchMatch, int> reads = new();
+
+        var resolution = Resolve(
+            [("winget", first), ("winget", other), ("winget", laterDuplicate)],
+            reads
+        );
+
+        Assert.Equal([0, 1], resolution.Matches.Select(match => match.FirstIndex));
+        Assert.Same(laterDuplicate, resolution.Matches[0].Package);
+        Assert.False(reads.ContainsKey(first));
+        Assert.Empty(resolution.Errors);
+    }
+
+    [Fact]
+    public void ResolveSearchMatchesStopsResolvingWhenCancelled()
+    {
+        using var cancellation = new CancellationTokenSource();
+        int resolvedCount = 0;
+        var matches = Enumerable
+            .Range(0, 50)
+            .Select(index =>
+                (
+                    "winget",
+                    new FakeSearchMatch($"Contoso.Tool{index}", "Contoso Tool", "1.0")
+                    {
+                        ReadResult = () =>
+                        {
+                            if (Interlocked.Increment(ref resolvedCount) == 3)
+                            {
+                                cancellation.Cancel();
+                            }
+
+                            return new("Contoso Tool", "1.0");
+                        },
+                    }
+                )
+            )
+            .ToArray();
+
+        Assert.ThrowsAny<OperationCanceledException>(() =>
+            Resolve(matches, parallelism: 1, cancellationToken: cancellation.Token)
+        );
+        Assert.Equal(3, resolvedCount);
+    }
+
+    [Fact]
+    public void ResolveSearchMatchesReportsUnreadablePackagesInOrderAndKeepsTheRest()
+    {
+        var unreadableId = new FakeSearchMatch("Contoso.Broken", "Broken", "1.0")
+        {
+            ReadId = () => throw new InvalidOperationException("id"),
+        };
+        var unreadableVersion = new FakeSearchMatch("Contoso.NoVersion", "No Version", "1.0")
+        {
+            ReadResult = () => throw new InvalidOperationException("version"),
+        };
+        var readable = new FakeSearchMatch("Contoso.Tool", "Contoso Tool", "1.0");
+
+        var resolution = Resolve(
+            [("winget", unreadableId), ("winget", unreadableVersion), ("winget", readable)]
+        );
+
+        Assert.Equal(["Contoso.Tool"], resolution.Matches.Select(match => match.Id));
+        Assert.Equal(["id", "version"], resolution.Errors.Select(error => error.Message));
+        Assert.Equal(3, resolution.ResultCount);
+    }
+
+    [Fact]
+    public void SelectUniqueSearchMatchesReturnsNothingForNoMatches()
+    {
+        Assert.Empty(NativeWinGetHelper.SelectUniqueSearchMatches([]));
+    }
+
+    [Fact]
     public void NativeWinGetCollectionCopiesWithoutEnumeratingWinRtCollections()
     {
         IReadOnlyList<string> nativeCollection = new EnumeratorThrowingReadOnlyList<string>(
@@ -848,6 +1045,90 @@ public sealed class WinGetManagerTests : IDisposable
 
         Assert.Equal("Contoso.StoreApp", Assert.Single(helper.BuildInstalledPackages(response)).Name);
         Assert.Equal("Contoso.StoreApp", Assert.Single(helper.BuildUpdatePackages(response)).Name);
+    }
+
+    private static ListResponse PingetCorrelatedListResponse(string id, string localId) =>
+        PingetCliHelper.DeserializeJson<ListResponse>(
+            $$"""
+            {
+                "Matches": [
+                    {
+                        "Name": "OpenTTD",
+                        "Id": "{{id}}",
+                        "LocalId": "{{localId.Replace("\\", "\\\\")}}",
+                        "InstalledVersion": "Unknown",
+                        "AvailableVersion": "15.3",
+                        "SourceName": "winget",
+                        "Publisher": "OpenTTD",
+                        "Scope": "Machine",
+                        "InstallerCategory": "exe",
+                        "InstallLocation": "D:\\SteamLibrary\\steamapps\\common\\OpenTTD",
+                        "PackageFamilyNames": [],
+                        "ProductCodes": [],
+                        "UpgradeCodes": []
+                    }
+                ],
+                "Warnings": [],
+                "Truncated": false
+            }
+            """
+        );
+
+    [Theory]
+    [InlineData(@"ARP\Machine\X86\Steam App 1536610", LocalSourceKind.Steam)]
+    [InlineData(@"ARP\Machine\X86\Uplay Install 4311", LocalSourceKind.Ubisoft)]
+    [InlineData(@"ARP\Machine\X86\1207658924_is1", LocalSourceKind.Gog)]
+    public void PingetCliHelperKeepsLauncherGamesCorrelatedToACatalogPackageOnTheirLauncher(
+        string localId,
+        LocalSourceKind expectedSourceKind
+    )
+    {
+        var manager = new WinGet();
+        var helper = new PingetCliHelper(manager, @"C:\Program Files\UniGetUI\pinget.exe");
+        ListResponse response = PingetCorrelatedListResponse("OpenTTD.OpenTTD", localId);
+
+        Package installed = Assert.Single(helper.BuildInstalledPackages(response));
+        Assert.Equal(localId, installed.Id);
+        Assert.Same(GetExpectedSource(manager, expectedSourceKind), installed.Source);
+        Assert.Empty(helper.BuildUpdatePackages(response));
+    }
+
+    [Fact]
+    public void PingetCliHelperStillOffersUpdatesForTheLauncherClientsThemselves()
+    {
+        var helper = new PingetCliHelper(new WinGet(), @"C:\Program Files\UniGetUI\pinget.exe");
+        ListResponse response = PingetCorrelatedListResponse("Valve.Steam", @"ARP\Machine\X86\Steam");
+
+        Package installed = Assert.Single(helper.BuildInstalledPackages(response));
+        Assert.Equal("Valve.Steam", installed.Id);
+        Assert.Equal("winget", installed.Source.Name);
+        Assert.Equal("Valve.Steam", Assert.Single(helper.BuildUpdatePackages(response)).Id);
+    }
+
+    [Theory]
+    [InlineData(@"ARP\Machine\X86\Steam App 1536610", LocalSourceKind.Steam)]
+    [InlineData(@"ARP\User\X64\Uplay Install 4311", LocalSourceKind.Ubisoft)]
+    [InlineData(@"ARP\Machine\X86\1207658924_is1", LocalSourceKind.Gog)]
+    public void GetLauncherGameSourceRecognizesLauncherGameEntries(
+        string localId,
+        LocalSourceKind expectedSourceKind
+    )
+    {
+        var manager = new WinGet();
+
+        Assert.Same(GetExpectedSource(manager, expectedSourceKind), manager.GetLauncherGameSource(localId));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData(@"ARP\Machine\X86\Steam")]
+    [InlineData(@"ARP\Machine\X86\Uplay")]
+    [InlineData(@"ARP\Machine\X64\{12345678-1234-1234-1234-123456789ABC}")]
+    [InlineData(@"ARP\Machine\X64\Contoso Tool_is1")]
+    public void GetLauncherGameSourceIgnoresOtherEntries(string? localId)
+    {
+        Assert.Null(new WinGet().GetLauncherGameSource(localId));
     }
 
     [Fact]
@@ -1761,6 +2042,25 @@ public sealed class WinGetManagerTests : IDisposable
     }
 
     [Fact]
+    public void AnExplicitUpdateVersionIsTheOneTrustedAndRecordedAsUpgraded()
+    {
+        var (manager, package) = CreateTrustTestPackage("Contoso.ExplicitTarget");
+        var options = new InstallOptions { SkipMajorUpdates = true, Version = "1.2.0", VersionIsExplicit = true };
+
+        var recorded = RecordTrustedHosts(() =>
+        {
+            manager.OperationHelper.GetParameters(package, options, OperationType.Update);
+            manager.OperationHelper.GetResult(package, OperationType.Update, [], 0);
+        });
+
+        Assert.Equal("1.2.0", Assert.Single(recorded).Version);
+        Assert.Equal(
+            "1.2.0",
+            Settings.GetDictionaryItem<string, string>(Settings.K.WinGetAlreadyUpgradedPackages, package.Id)
+        );
+    }
+
+    [Fact]
     public void ARebootToFinishTheInstallStillTrustsItsHost()
     {
         var (manager, package) = CreateTrustTestPackage("Contoso.RebootToFinish");
@@ -1814,6 +2114,100 @@ public sealed class WinGetManagerTests : IDisposable
         );
 
         Assert.Empty(recorded);
+    }
+
+    [Theory]
+    [InlineData(true, true, "", "1.5.0")]
+    [InlineData(false, true, "", null)]
+    [InlineData(true, false, "", null)]
+    [InlineData(true, true, "1.2.0", "1.2.0")]
+    public void AnUpdateTargetsAVersionOnlyWhenPinnedWhileMajorUpdatesAreSkipped(
+        bool skipsMajorUpdates,
+        bool pinnedWithinMajor,
+        string requestedVersion,
+        string? targetedVersion
+    )
+    {
+        var manager = new WinGet();
+        SetCliToolKind(manager, WinGetCliToolKind.SystemWinGet);
+        var package = new PackageBuilder()
+            .WithManager(manager)
+            .WithId($"Contoso.Pinned{skipsMajorUpdates}{pinnedWithinMajor}{requestedVersion}")
+            .WithVersion("1.0.0")
+            .WithNewVersion("1.5.0")
+            .Build();
+        package.OverridenOptions.PinUpdateToNewVersion = pinnedWithinMajor;
+        var options = new InstallOptions { SkipMajorUpdates = skipsMajorUpdates };
+        if (requestedVersion.Length > 0)
+        {
+            options.Version = requestedVersion;
+            options.VersionIsExplicit = true;
+        }
+
+        var parameters = RecordTrustedHostsParameters(manager, package, OperationType.Update, options);
+        var standalone = manager.OperationHelper.GetStandaloneParameters(package, options, OperationType.Update);
+
+        foreach (var built in new[] { parameters, standalone })
+        {
+            int index = built.ToList().IndexOf("--version");
+            if (targetedVersion is null)
+                Assert.Equal(-1, index);
+            else
+                Assert.Equal(CoreTools.EscapeCommandLineArgument(targetedVersion), built[index + 1]);
+        }
+    }
+
+    [Fact]
+    public void AMajorUpdateIsNeverPinned()
+    {
+        var (manager, package) = CreateTrustTestPackage("Contoso.MajorNotPinned");
+
+        var parameters = RecordTrustedHostsParameters(
+            manager,
+            package,
+            OperationType.Update,
+            new InstallOptions { SkipMajorUpdates = true }
+        );
+
+        Assert.DoesNotContain("--version", parameters);
+    }
+
+    [Fact]
+    public void ARequestedUpdateVersionIsRefusedUnderPinget()
+    {
+        var (manager, package) = CreateTrustTestPackage("Contoso.PinnedPinget");
+        SetCliToolKind(manager, WinGetCliToolKind.BundledPinget);
+
+        Assert.Throws<InvalidOperationException>(
+            () => manager.OperationHelper.GetParameters(
+                package,
+                new InstallOptions { SkipMajorUpdates = true, Version = "1.2.0", VersionIsExplicit = true },
+                OperationType.Update
+            )
+        );
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void UpdatesWithinTheMajorAreOfferedOnlyThroughSystemWinGet(bool systemWinGet)
+    {
+        var manager = new WinGet();
+        SetCliToolKind(manager, systemWinGet ? WinGetCliToolKind.SystemWinGet : WinGetCliToolKind.BundledPinget);
+
+        Assert.Equal(systemWinGet, manager.CanUpdateToExactVersion);
+    }
+
+    private static IReadOnlyList<string> RecordTrustedHostsParameters(
+        WinGet manager,
+        IPackage package,
+        OperationType operation,
+        InstallOptions options
+    )
+    {
+        IReadOnlyList<string> parameters = [];
+        RecordTrustedHosts(() => parameters = manager.OperationHelper.GetParameters(package, options, operation));
+        return parameters;
     }
 
     private static (WinGet Manager, IPackage Package) CreateTrustTestPackage(string id)
@@ -2630,6 +3024,113 @@ public sealed class WinGetManagerTests : IDisposable
     }
 
     [Fact]
+    public void WinGetInstallKeepsTheCatalogIdentifierAfterAnUninstallUsedTheLocalOne()
+    {
+        var manager = new WinGet();
+        SetCliToolKind(manager, WinGetCliToolKind.SystemWinGet);
+        var package = BuildNodeJsPackage(manager, "OpenJS.NodeJS.Reinstalled");
+        NativePackageHandler.AddLocalIdentifier(package, NodeJsLocalIdentifier);
+        package.OverridenOptions.WinGet_UseLocalIdentifier = true;
+
+        var uninstall = manager.OperationHelper.GetParameters(
+            package,
+            new InstallOptions(),
+            OperationType.Uninstall
+        );
+        var install = manager.OperationHelper.GetParameters(
+            package,
+            new InstallOptions
+            {
+                Version = "3.0.0",
+                Architecture = Architecture.x64,
+                InstallationScope = PackageScope.Machine,
+            },
+            OperationType.Install
+        );
+
+        Assert.Contains($"\"{NodeJsLocalIdentifier}\"", uninstall);
+        Assert.Contains("\"OpenJS.NodeJS.Reinstalled\"", install);
+        Assert.DoesNotContain($"\"{NodeJsLocalIdentifier}\"", install);
+        Assert.Contains("x64", install);
+        Assert.Contains("machine", install);
+    }
+
+    [Theory]
+    [InlineData("", "", null, null, "", "", "", "")]
+    [InlineData("--override /S", "", null, null, "", "", "", "")]
+    [InlineData("--version 1.2.0", "", null, null, "", "1.2.0", "", "")]
+    [InlineData("--version=1.2.0", "", null, null, "", "1.2.0", "", "")]
+    [InlineData("-v 1.2.0", "3.0.0", null, null, "--version", "1.2.0", "", "")]
+    [InlineData("--scope Machine", "", null, null, "", "", "machine", "")]
+    [InlineData("--scope machine", "", "user", null, "--scope", "", "machine", "")]
+    [InlineData("--scope everywhere", "", null, null, "--scope", "", "everywhere", "")]
+    [InlineData("-a x64", "", null, null, "", "", "", "x64")]
+    [InlineData("--architecture x64", "", null, "arm64", "--architecture", "", "", "x64")]
+    [InlineData("--architecture neutral", "", null, null, "--architecture", "", "", "neutral")]
+    [InlineData("--id Other.App --source msstore", "", null, null, "--id,--source", "", "", "")]
+    [InlineData("-s winget -m C:\\app.yaml", "", null, null, "-s,-m", "", "", "")]
+    [InlineData("--version \"1.2.0\"", "", null, null, "", "1.2.0", "", "")]
+    [InlineData("--scope \"machine\" -a \"x64\"", "", null, null, "", "", "machine", "x64")]
+    [InlineData("--override \"/S --version 9 /D=C:\\Apps\"", "", null, null, "", "", "", "")]
+    [InlineData("--installer-type msi", "", null, null, "--installer-type", "", "", "")]
+    [InlineData("--silent --version", "", null, null, "--version", "", "", "")]
+    [InlineData("--version \"\"", "", null, null, "--version", "", "", "")]
+    [InlineData("--locale fr-CA", "", null, null, "--locale", "", "", "")]
+    public void AReinstallChecksTheTargetTheCustomInstallParametersSelect(
+        string customInstall,
+        string version,
+        string? scope,
+        string? architecture,
+        string expectedConflicts,
+        string expectedVersion,
+        string expectedScope,
+        string expectedArchitecture
+    )
+    {
+        var options = new InstallOptions
+        {
+            Version = version,
+            CustomParameters_Install = customInstall.Split(' ', StringSplitOptions.RemoveEmptyEntries).ToList(),
+            CustomParameters_Uninstall = ["--id", "Uninstall.Only"],
+        };
+
+        var target = WinGetPkgOperationHelper.ResolveReinstallTarget(options, scope, architecture);
+
+        Assert.Equal(expectedConflicts, string.Join(",", target.Conflicts));
+        if (expectedConflicts.Length > 0)
+            return;
+        Assert.Equal(expectedVersion.Length > 0 ? expectedVersion : version, target.Version);
+        Assert.Equal(expectedScope.Length > 0 ? expectedScope : scope, target.Scope);
+        Assert.Equal(expectedArchitecture.Length > 0 ? expectedArchitecture : architecture, target.Architecture);
+    }
+
+    [Theory]
+    [InlineData("", "")]
+    [InlineData("--version 1.2.0", "--version|1.2.0")]
+    [InlineData("--version \"1.2.0\"", "--version|1.2.0")]
+    [InlineData("--override \"/S /D=C:\\Program Files\\App\"", "--override|/S /D=C:\\Program Files\\App")]
+    [InlineData("--override \"/S \\\"quoted\\\"\"", "--override|/S \"quoted\"")]
+    [InlineData("--override \"a \"\"b\"\" c\"", "--override|a \"b\" c")]
+    [InlineData("--location C:\\Apps\\ -a x64", "--location|C:\\Apps\\|-a|x64")]
+    [InlineData("--location \"C:\\Apps\\\\\" -a x64", "--location|C:\\Apps\\|-a|x64")]
+    [InlineData("\"\" --silent", "|--silent")]
+    public void CustomInstallArgumentsAreSplitTheWayWindowsPassesThemToWinGet(string commandLine, string expected)
+    {
+        Assert.Equal(expected, string.Join("|", WinGetPkgOperationHelper.SplitWindowsArguments(commandLine)));
+    }
+
+    [Fact]
+    public void AWinGetReinstallIsNotRefusedWhenItCannotBeCheckedWithoutTheComApi()
+    {
+        var manager = new WinGet();
+        var package = BuildNodeJsPackage(manager, "OpenJS.NodeJS.Unchecked");
+
+        Assert.Null(
+            manager.OperationHelper.GetReinstallRefusal(package, new InstallOptions { Version = "3.0.0" })
+        );
+    }
+
+    [Fact]
     public void WinGetInstallDoesNotRetryWithTheLocalIdentifier()
     {
         var manager = new WinGet();
@@ -2711,25 +3212,129 @@ public sealed class WinGetManagerTests : IDisposable
     [Fact]
     public void WinGetUpdateNotApplicableViaPingetWithZeroExitCodeFails()
     {
-        var manager = new WinGet();
-        SetCliToolKind(manager, WinGetCliToolKind.BundledPinget);
-        var package = new PackageBuilder()
-            .WithManager(manager)
-            .WithId("Contoso.Tool")
-            .WithVersion("1.0.0")
-            .WithNewVersion("2.0.0")
-            .Build();
+        var (manager, package) = BuildPingetUpdatePackage("Contoso.PhantomTool");
 
-        var veredict = manager.OperationHelper.GetResult(
-            package,
-            OperationType.Update,
-            ["No applicable upgrade found."],
-            0
-        );
+        var veredict = RunPingetNoUpgradeResult(manager, package, _ => ListResponseWith([], []));
 
         OperationAssert.HasVeredict(veredict, OperationVeredict.Failure);
         Assert.True(WinGetPkgOperationHelper.IsStuckUpgradeLoop(package));
     }
+
+    [Fact]
+    public void WinGetPingetNoUpgradeKeepsTheUpdateWhenASecondLookupStillOffersIt()
+    {
+        var (manager, package) = BuildPingetUpdatePackage("Contoso.OfferedTool");
+        var queries = new List<ListQuery>();
+        ListResponse StillOffered(ListQuery query)
+        {
+            queries.Add(query);
+            return ListResponseWith(
+                [
+                    new ListMatch
+                    {
+                        Name = "Contoso Tool",
+                        Id = "Contoso.OfferedTool",
+                        LocalId = "Contoso.OfferedTool",
+                        InstalledVersion = "1.0.0",
+                        AvailableVersion = "2.0.0",
+                    },
+                ],
+                []
+            );
+        }
+
+        for (int attempt = 0; attempt < 5; attempt++)
+        {
+            var veredict = RunPingetNoUpgradeResult(manager, package, StillOffered);
+            OperationAssert.HasVeredict(veredict, OperationVeredict.Failure);
+        }
+
+        Assert.False(WinGetPkgOperationHelper.IsStuckUpgradeLoop(package));
+        Assert.False(WinGetPkgOperationHelper.ConsumeAlreadyUpgradedSuppression(package));
+        ListQuery query = queries[0];
+        Assert.Equal("Contoso.OfferedTool", query.Id);
+        Assert.True(query.Exact);
+        Assert.True(query.UpgradeOnly);
+        Assert.True(query.IncludeUnknown);
+        Assert.True(query.IncludePinned);
+    }
+
+    [Fact]
+    public void WinGetPingetNoUpgradeKeepsTheUpdateWhenTheSourceCannotBeRead()
+    {
+        var (manager, package) = BuildPingetUpdatePackage("Contoso.UnreadableTool");
+
+        for (int attempt = 0; attempt < 5; attempt++)
+        {
+            RunPingetNoUpgradeResult(
+                manager,
+                package,
+                _ => ListResponseWith(
+                    [],
+                    [
+                        "Failed when searching source 'winget'; results will not be included: candidate source.msix failed: error sending request for url (https://cdn.winget.microsoft.com/cache/source.msix)",
+                    ]
+                )
+            );
+        }
+
+        Assert.False(WinGetPkgOperationHelper.IsStuckUpgradeLoop(package));
+        Assert.False(WinGetPkgOperationHelper.ConsumeAlreadyUpgradedSuppression(package));
+    }
+
+    [Fact]
+    public void WinGetPingetNoUpgradeKeepsTheUpdateWhenTheSecondLookupThrows()
+    {
+        var (manager, package) = BuildPingetUpdatePackage("Contoso.LockedTool");
+
+        var veredict = RunPingetNoUpgradeResult(
+            manager,
+            package,
+            _ => throw new IOException("Failed locking file index.db (os error 33)")
+        );
+
+        OperationAssert.HasVeredict(veredict, OperationVeredict.Failure);
+        Assert.False(WinGetPkgOperationHelper.IsStuckUpgradeLoop(package));
+    }
+
+    private static (WinGet Manager, IPackage Package) BuildPingetUpdatePackage(string id)
+    {
+        var manager = new WinGet();
+        SetCliToolKind(manager, WinGetCliToolKind.BundledPinget);
+        var package = new PackageBuilder()
+            .WithManager(manager)
+            .WithId(id)
+            .WithVersion("1.0.0")
+            .WithNewVersion("2.0.0")
+            .Build();
+        return (manager, package);
+    }
+
+    private static OperationVeredict RunPingetNoUpgradeResult(
+        WinGet manager,
+        IPackage package,
+        Func<ListQuery, ListResponse> listUpgrades
+    )
+    {
+        var original = WinGetPkgOperationHelper.ListUpgrades;
+        WinGetPkgOperationHelper.ListUpgrades = listUpgrades;
+        try
+        {
+            return manager.OperationHelper.GetResult(
+                package,
+                OperationType.Update,
+                ["No applicable upgrade found."],
+                0
+            );
+        }
+        finally
+        {
+            WinGetPkgOperationHelper.ListUpgrades = original;
+        }
+    }
+
+    private static ListResponse ListResponseWith(List<ListMatch> matches, List<string> warnings) =>
+        new() { Matches = matches, Warnings = warnings };
 
     [Fact]
     public void WinGetGenericPingetFailureDoesNotRetry()
@@ -3184,6 +3789,48 @@ public sealed class WinGetManagerTests : IDisposable
     }
 
     [Fact]
+    public async Task WinGetPingetNoUpgradeExplainsAnUnreadableSourceToTheUser()
+    {
+        var (_, package) = BuildPingetUpdatePackage("Contoso.BusySourceTool");
+        using var operation = new VeredictProbingUpdateOperation(package, new InstallOptions());
+        var original = WinGetPkgOperationHelper.ListUpgrades;
+        WinGetPkgOperationHelper.ListUpgrades = _ => ListResponseWith([], ["Failed when searching source 'winget'"]);
+        try
+        {
+            var veredict = await operation.ProbeProcessVeredict(0, ["No applicable upgrade found."]);
+
+            OperationAssert.HasVeredict(veredict, OperationVeredict.Failure);
+            Assert.Contains("busy or unreachable", operation.Metadata.FailureMessage);
+            Assert.DoesNotContain("may already be up to date", operation.Metadata.FailureMessage);
+            Assert.False(operation.Metadata.FailureMessage.EndsWith('.'));
+        }
+        finally
+        {
+            WinGetPkgOperationHelper.ListUpgrades = original;
+        }
+    }
+
+    [Fact]
+    public async Task WinGetPingetNoUpgradeConfirmedBySecondLookupKeepsTheUpToDateMessage()
+    {
+        var (_, package) = BuildPingetUpdatePackage("Contoso.ConfirmedTool");
+        using var operation = new VeredictProbingUpdateOperation(package, new InstallOptions());
+        var original = WinGetPkgOperationHelper.ListUpgrades;
+        WinGetPkgOperationHelper.ListUpgrades = _ => ListResponseWith([], []);
+        try
+        {
+            var veredict = await operation.ProbeProcessVeredict(0, ["No applicable upgrade found."]);
+
+            OperationAssert.HasVeredict(veredict, OperationVeredict.Failure);
+            Assert.Contains("may already be up to date", operation.Metadata.FailureMessage);
+        }
+        finally
+        {
+            WinGetPkgOperationHelper.ListUpgrades = original;
+        }
+    }
+
+    [Fact]
     public async Task WinGetInstallerHashMismatchExplainsTheAdminBlock()
     {
         var manager = new WinGet();
@@ -3313,6 +3960,261 @@ public sealed class WinGetManagerTests : IDisposable
                 unchecked((int)0x8A150102)
             )
         );
+    }
+
+    private static readonly WinGetPkgOperationHelper.PortableArpEntry FfmpegPortableEntry = new(
+        @"C:\Users\test\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg",
+        MachineScope: false
+    );
+
+    private const string FfmpegLinksDirectory = @"C:\Users\test\AppData\Local\Microsoft\WinGet\Links";
+
+    [Theory]
+    [InlineData(true, true, false, true)]
+    [InlineData(true, true, true, false)]
+    [InlineData(true, false, false, false)]
+    [InlineData(false, true, false, false)]
+    public void WinGetElevatesPortablesOnlyWhenTheirLinksCannotBeRecreatedByTheSameAccount(
+        bool canElevateAsCurrentAccount,
+        bool hasLinks,
+        bool canCreateSymlinks,
+        bool expected
+    )
+    {
+        Assert.Equal(
+            expected,
+            WinGetPkgOperationHelper.PortableUpdateNeedsElevation(
+                FfmpegPortableEntry,
+                _ => hasLinks ? FfmpegLinksDirectory : null,
+                directory =>
+                {
+                    Assert.Equal(FfmpegLinksDirectory, directory);
+                    return canCreateSymlinks;
+                },
+                () => canElevateAsCurrentAccount
+            )
+        );
+    }
+
+    [Fact]
+    public void WinGetDoesNotProbeAnythingForPackagesThatAreNotPortable()
+    {
+        Assert.False(
+            WinGetPkgOperationHelper.PortableUpdateNeedsElevation(
+                null,
+                _ => throw new InvalidOperationException("The links folder must not be scanned"),
+                _ => throw new InvalidOperationException("The symlink probe must not run"),
+                () => throw new InvalidOperationException("The token must not be read")
+            )
+        );
+    }
+
+    [Theory]
+    [InlineData(OperationType.Update, true)]
+    [InlineData(OperationType.Install, true)]
+    [InlineData(OperationType.Uninstall, null)]
+    public void WinGetElevationRequirementsKeepPortableLinksEvenWithoutTheComApi(
+        OperationType operation,
+        bool? expected
+    )
+    {
+        var manager = new WinGet();
+        var package = CreatePortablePackage(manager);
+
+        WithPortableLinkSeams(
+            canElevate: true,
+            canCreateSymlinks: false,
+            () => manager.OperationHelper.ApplyElevationRequirements(package, new InstallOptions(), operation)
+        );
+
+        Assert.Equal(expected, package.OverridenOptions.RunAsAdministrator);
+    }
+
+    [Theory]
+    [InlineData(OperationType.Update, false, true)]
+    [InlineData(OperationType.Update, true, null)]
+    [InlineData(OperationType.Install, false, true)]
+    [InlineData(OperationType.Install, true, null)]
+    public void WinGetCommandPreviewsDoNotDecidePortableLinkElevation(
+        OperationType operation,
+        bool standalone,
+        bool? expected
+    )
+    {
+        var manager = new WinGet();
+        var package = CreatePortablePackage(manager);
+        var options = new InstallOptions();
+
+        WithPortableLinkSeams(
+            canElevate: true,
+            canCreateSymlinks: false,
+            () =>
+            {
+                if (standalone)
+                    manager.OperationHelper.GetStandaloneParameters(package, options, operation);
+                else
+                    manager.OperationHelper.GetParameters(package, options, operation);
+            }
+        );
+
+        Assert.Equal(expected, package.OverridenOptions.RunAsAdministrator);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void WinGetPortableLinkElevationNeverOverridesAnEarlierDecision(bool earlierDecision)
+    {
+        var package = CreatePortablePackage(new WinGet());
+        package.OverridenOptions.RunAsAdministrator = earlierDecision;
+
+        WithPortableLinkSeams(
+            canElevate: true,
+            canCreateSymlinks: false,
+            () => WinGetPkgOperationHelper.ApplyPortableLinkElevation(
+                package,
+                OperationType.Update,
+                FfmpegPortableEntry
+            )
+        );
+
+        Assert.Equal(earlierDecision, package.OverridenOptions.RunAsAdministrator);
+    }
+
+    [Fact]
+    public void WinGetPortableLinkElevationIsNotAppliedToBrokeredOperations()
+    {
+        var package = CreatePortablePackage(new WinGet());
+        Settings.Set(Settings.K.UseAgentBroker, true);
+
+        WithPortableLinkSeams(
+            canElevate: true,
+            canCreateSymlinks: false,
+            () => WinGetPkgOperationHelper.ApplyPortableLinkElevation(
+                package,
+                OperationType.Update,
+                FfmpegPortableEntry
+            )
+        );
+
+        Assert.Null(package.OverridenOptions.RunAsAdministrator);
+    }
+
+    [Fact]
+    public void WinGetPortableLinkElevationSurvivesAFailingLinksScan()
+    {
+        var package = CreatePortablePackage(new WinGet());
+        var originalFind = WinGetPkgOperationHelper.FindPortableLinksDirectory;
+        WinGetPkgOperationHelper.FindPortableLinksDirectory = _ => throw new IOException("Access denied");
+        try
+        {
+            WithPortableLinkSeams(
+                canElevate: true,
+                canCreateSymlinks: false,
+                () => WinGetPkgOperationHelper.ApplyPortableLinkElevation(
+                    package,
+                    OperationType.Update,
+                    FfmpegPortableEntry
+                ),
+                replaceLinksScan: false
+            );
+        }
+        finally
+        {
+            WinGetPkgOperationHelper.FindPortableLinksDirectory = originalFind;
+        }
+
+        Assert.Null(package.OverridenOptions.RunAsAdministrator);
+    }
+
+    [Fact]
+    public void WinGetFindsTheLinksFolderOnlyWhenALinkPointsIntoTheInstallLocation()
+    {
+        string installLocation = Path.Combine(_testRoot, "Packages", "Gyan.FFmpeg");
+        string otherLocation = Path.Combine(_testRoot, "Packages", "Gyan.FFmpegPlus");
+        string linksDirectory = Path.Combine(_testRoot, "Links");
+        Directory.CreateDirectory(Path.Combine(installLocation, "bin"));
+        Directory.CreateDirectory(otherLocation);
+        Directory.CreateDirectory(linksDirectory);
+        File.WriteAllText(Path.Combine(installLocation, "bin", "ffmpeg.exe"), "");
+        File.WriteAllText(Path.Combine(otherLocation, "ffmpeg.exe"), "");
+        File.WriteAllText(Path.Combine(linksDirectory, "notalink.exe"), "");
+        var entry = new WinGetPkgOperationHelper.PortableArpEntry(installLocation, MachineScope: false);
+
+        Assert.Null(WinGetPkgOperationHelper.FindLinksDirectoryPointingInto(entry, [linksDirectory]));
+        Assert.Null(
+            WinGetPkgOperationHelper.FindLinksDirectoryPointingInto(
+                entry,
+                [Path.Combine(_testRoot, "Missing")]
+            )
+        );
+
+        if (!WinGetPkgOperationHelper.ProbeSymlinkCreation(linksDirectory))
+            return;
+
+        File.CreateSymbolicLink(
+            Path.Combine(linksDirectory, "ffmpegplus.exe"),
+            Path.Combine(otherLocation, "ffmpeg.exe")
+        );
+        Assert.Null(WinGetPkgOperationHelper.FindLinksDirectoryPointingInto(entry, [linksDirectory]));
+
+        File.CreateSymbolicLink(
+            Path.Combine(linksDirectory, "ffmpeg.exe"),
+            Path.Combine(installLocation, "bin", "ffmpeg.exe")
+        );
+        Assert.Equal(
+            linksDirectory,
+            WinGetPkgOperationHelper.FindLinksDirectoryPointingInto(entry, [linksDirectory])
+        );
+    }
+
+    [Fact]
+    public void WinGetSymlinkProbeLeavesNothingBehind()
+    {
+        string linksDirectory = Path.Combine(_testRoot, "ProbeRoot", "Links");
+        Directory.CreateDirectory(linksDirectory);
+
+        WinGetPkgOperationHelper.ProbeSymlinkCreation(linksDirectory);
+
+        Assert.Equal([linksDirectory], Directory.GetDirectories(Path.Combine(_testRoot, "ProbeRoot")));
+        Assert.Empty(Directory.EnumerateFileSystemEntries(linksDirectory));
+    }
+
+    private static Package CreatePortablePackage(WinGet manager) =>
+        new PackageBuilder()
+            .WithManager(manager)
+            .WithName("FFmpeg")
+            .WithId("Gyan.FFmpeg")
+            .WithVersion("8.0")
+            .Build();
+
+    private static void WithPortableLinkSeams(
+        bool canElevate,
+        bool canCreateSymlinks,
+        Action run,
+        bool replaceLinksScan = true
+    )
+    {
+        var originalRead = WinGetPkgOperationHelper.ReadPortableArpEntry;
+        var originalFind = WinGetPkgOperationHelper.FindPortableLinksDirectory;
+        var originalProbe = WinGetPkgOperationHelper.CanCreateSymlinksIn;
+        var originalElevate = WinGetPkgOperationHelper.CanElevateAsCurrentAccount;
+        WinGetPkgOperationHelper.ReadPortableArpEntry = _ => FfmpegPortableEntry;
+        if (replaceLinksScan)
+            WinGetPkgOperationHelper.FindPortableLinksDirectory = _ => FfmpegLinksDirectory;
+        WinGetPkgOperationHelper.CanCreateSymlinksIn = _ => canCreateSymlinks;
+        WinGetPkgOperationHelper.CanElevateAsCurrentAccount = () => canElevate;
+        try
+        {
+            run();
+        }
+        finally
+        {
+            WinGetPkgOperationHelper.ReadPortableArpEntry = originalRead;
+            WinGetPkgOperationHelper.FindPortableLinksDirectory = originalFind;
+            WinGetPkgOperationHelper.CanCreateSymlinksIn = originalProbe;
+            WinGetPkgOperationHelper.CanElevateAsCurrentAccount = originalElevate;
+        }
     }
 
     [Fact]

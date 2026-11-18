@@ -14,13 +14,25 @@ namespace UniGetUI.PackageEngine.Managers.PacmanManager;
 
 public class Pacman : PackageManager
 {
+    public override bool ExpectsInstalledPackages => true;
+
+    public Func<bool> ForeignPackagesListedElsewhere { get; set; } = () => false;
+
+    public override int? CompareVersions(string versionA, string versionB) =>
+        AlpmVersion.Compare(versionA, versionB);
+
+    internal static string InstalledListingArguments(bool foreignPackagesListedElsewhere) =>
+        foreignPackagesListedElsewhere ? "-Qn" : "-Q";
+
     public Pacman()
     {
         Dependencies = [];
 
         Capabilities = new ManagerCapabilities
         {
+            CanReinstallOnUpdate = true,
             CanRunAsAdmin = true,
+            CanListDependencies = true,
             CanSkipIntegrityChecks = false,
             SupportsCustomSources = false,
             SupportsProxy = ProxySupport.No,
@@ -32,6 +44,7 @@ public class Pacman : PackageManager
         {
             Id = "pacman",
             Name = "Pacman",
+            SetupGuide = "PACKAGE_MANAGERS.md#pacman",
             Description = CoreTools.Translate(
                 "The default package manager for Arch Linux and its derivatives.<br>Contains: <b>Arch Linux packages</b>"
             ),
@@ -180,7 +193,7 @@ public class Pacman : PackageManager
             StartInfo = new ProcessStartInfo
             {
                 FileName = Status.ExecutablePath,
-                Arguments = "-Q",
+                Arguments = InstalledListingArguments(ForeignPackagesListedElsewhere()),
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,

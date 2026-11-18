@@ -13,7 +13,7 @@ Solution entry points:
 The codebase follows a **layered, modular structure** with ~40 projects:
 
 - **`UniGetUI.Avalonia/`** - Avalonia entry point, AXAML pages, controls, and app shell (`Program.cs`, `Views/MainWindow.axaml`)
-- **`SharedAssets/`** - shared app icons, symbols, splash images, and utility scripts used by packaging
+- **`SharedAssets/`** - shared app icons, symbols, and utility scripts used by packaging
 - **`UniGetUI.Core.*`** - Shared infrastructure: `Logger`, `Settings`, `Tools` (includes `CoreTools.Translate()`), `IconEngine`, `LanguageEngine`
 - **`UniGetUI.PackageEngine.Interfaces`** - Contracts: `IPackageManager`, `IPackage`, `IManagerSource`, `IPackageDetails`
 - **`UniGetUI.PackageEngine.PackageManagerClasses`** - Base implementations: `PackageManager` (abstract), `Package`, helpers (`BasePkgDetailsHelper`, `BasePkgOperationHelper`, `BaseSourceHelper`)
@@ -76,13 +76,27 @@ place under the same version keeps showing the icon it had until a restart.
 |---|---|
 | `SearchQueryService` (3.5.0 → 3.0.0-beta → unversioned) | package search |
 | `PackageBaseAddress/3.0.0` | version enumeration, update detection, `.nupkg` and embedded-icon URLs |
-| `RegistrationsBaseUrl` (3.6.0 → 3.4.0 → 3.0.0-rc → 3.0.0-beta → unversioned) | package metadata, listed/unlisted checks |
+| `RegistrationsBaseUrl` (3.6.0 → 3.4.0 → 3.0.0-rc → 3.0.0-beta → unversioned) | package metadata, listed/unlisted checks; versions, `.nupkg` URLs and metadata when there is no `PackageBaseAddress` |
 
 A feed needs `PackageBaseAddress` or `RegistrationsBaseUrl` to be usable. If it advertises no
 `SearchQueryService` — or its search returns nothing — search degrades to an exact
 package-id lookup against the flat container. Flat-container version lists include unlisted
 versions, so an update candidate is confirmed against its registration leaf before being
-surfaced.
+surfaced. A version index answering 404 means the package is not on that feed, not a failed
+check, since .NET Tool asks every configured feed about every installed tool.
+
+A registration-only feed (JFrog Artifactory serves no flat container) is read through its
+registration index instead: versions come from its pages, fetching only the pages above the
+installed version during an update check; the `.nupkg` URL comes from the registration leaf;
+and metadata comes from the version's page entry when the leaf carries no `catalogEntry`.
+None of this runs for a feed that has a flat container.
+
+On V2, Artifactory answers `GetUpdates()` with nothing unless `includeAllVersions` is true, and
+then truncates the list at 100 without a next link. So when every `GetUpdates()` batch of a
+source comes back empty, one `includeAllVersions=true` request tells "nothing is newer" (still
+empty: stop there) from "this server ignores the request", in which case each installed package
+is looked up with `FindPackagesById()?$filter=IsLatestVersion` (`IsAbsoluteLatestVersion` with
+pre-releases). V2 version lists follow `next` links, up to 50 pages.
 
 ### Fallback behaviour
 
@@ -92,9 +106,24 @@ retried against a fabricated V2 endpoint. V2-only feeds never enter the V3 path 
 
 ### Which feed is which
 
-- **.NET Tool** — `https://api.nuget.org/v3/index.json`. Safe to repoint because the manager
-  does not support custom sources and never passes the source URL to the `dotnet` CLI. Also
-  filters search on `packageType=DotnetTool`.
+- **.NET Tool** — the enabled sources of the user's NuGet configuration, read (not edited) by
+  `DotNetSourceHelper` from `dotnet nuget list source --format Detailed` run in the user profile
+  with `DOTNET_CLI_UI_LANGUAGE=en`, so `disabledPackageSources` and the whole config hierarchy
+  apply as they do for `dotnet tool install`. Output it cannot read, or a failed command, falls
+  back to nuget.org. The files from `dotnet nuget config paths` supply `packageSourceMapping`
+  (an installed package is never sent to a feed the mapping does not allow for its id) and basic
+  `packageSourceCredentials` (clear text, or DPAPI-encrypted with the `NuGet` entropy on
+  Windows; a closer file's entry wins even when it cannot be used, such as one restricted to
+  `negotiate`). `NuGetFeedCredentials` keys each credential by its feed, since feeds sharing a
+  server (Azure Artifacts) carry different ones, and sends it only on requests made for that
+  feed and only to that feed's own server; every request site passes the feed it belongs to.
+  The snapshot is kept until a config file's write time changes, or for ten minutes. Updates are
+  checked on every enabled feed and the newest wins; the feed at nuget.org's URL is always
+  `DefaultSource`, whatever its key. `dotnet tool list` names no feed, so installed tools sit
+  under nuget.org when it is enabled, else the first feed, and `InstalledPackagesKeepTheirSource`
+  is false so loaders match them to updates and search results from any feed by id. Search
+  filters on `packageType=DotnetTool` on V3 feeds and local folders; V2 feeds have no such
+  filter and may list libraries. Icons and installer downloads do not carry credentials.
 - **PowerShell / PowerShell 7** — sources are enumerated from `Get-PSRepository` (or
   `Get-PSResourceRepository` on PowerShell 7), so the URL is CLI-owned identity
   (`PowerShellSourceHelper` compares it literally to choose `Register-PSRepository -Default`)
@@ -214,20 +243,32 @@ the opposite way depending on the feed it came from:
 So the comparison is per-manager, not global. `IPackageManager.CompareVersions(a, b)` returns the
 usual negative/zero/positive, or `null` when two versions cannot be meaningfully compared:
 
-- **Default** (`PackageManager.CompareVersions`) - the numeric comparison above. Used by Scoop,
-  WinGet, Apt, Dnf, Pacman, Homebrew, vcpkg, Snap and Flatpak.
+- **Default** (`PackageManager.CompareVersions`) - the numeric comparison above. Used by WinGet,
+  Apt, Dnf, Homebrew, vcpkg, Snap and Flatpak.
+- **`ScoopVersion`** in the Scoop manager project - a port of Scoop's own `Compare-Version`
+  (`lib/versions.ps1`), which is what `scoop status` uses to call an app outdated. A dash
+  revision stays newer (`7.1.2-35` > `7.1.2`), while a part matching `alpha|beta|rc|pre` ranks
+  below the release and labels compare as text, so `7.7.0-preview.5` < `7.7.0-rc.1` < `7.7.0`.
+  It returns `null` wherever Scoop reaches no verdict, including two `nightly` versions, and
+  never falls back to the default.
 - **`SemanticVersion`** in `UniGetUI.Core.Tools` - SemVer 2.0 with NuGet's fourth numeric segment
   allowed. Used by `BaseNuGet` (so Chocolatey, .NET Tool, Windows PowerShell and PowerShell 7),
   npm, Bun and Cargo.
 - **`PythonVersion`** in `UniGetUI.Core.Tools` - PEP 440, matching Python's packaging library.
   Used by Pip.
+- **`AlpmVersion`** in the Pacman manager project - a port of libalpm's `alpm_pkg_vercmp`
+  (epoch, then version and release through rpmvercmp), so `1.0.1-1` is newer than `1.0-2` and an
+  epoch outranks any version. Used by Pacman and AUR. It accepts every string, so it never falls
+  back to the default.
 
 Each override falls back to the base implementation when its own parser rejects the input, so an
 unparseable version behaves exactly as it did before.
 
-Three call sites consume it: `Package.NewerVersionIsInstalled()`, which decides whether an update
-is offered at all; `BaseNuGet.KeepUpdatesNewerThanInstalled`; and the
-`UninstallPreviousVersionsOnUpdate` match, which removes superseded copies. Display sorting
+Four call sites consume it: `Package.NewerVersionIsInstalled()`, which decides whether an update
+is offered at all; `BaseNuGet.KeepUpdatesNewerThanInstalled`; the
+`UninstallPreviousVersionsOnUpdate` match, which removes superseded copies; and
+`PackageManager.NewestVersionWithinMajor`, which picks the update offered in place of a skipped
+major one (see the next section), so a wrong comparator there installs the wrong version. Display sorting
 deliberately does not - those lists mix managers, and a comparison between two packages from
 different ecosystems has no single correct answer.
 
@@ -235,6 +276,26 @@ When adding a manager, pick the comparator its registry actually uses. Getting i
 real updates or offers downgrades, and the tests in `PackageTests.cs` assert both directions:
 that SemVer and PEP 440 managers order pre-releases below their releases, and that revision
 ecosystems keep reading a trailing suffix as newer.
+
+## Skipping major updates
+
+The per-package `SkipMajorUpdates` install option hides an update whose first version number
+changes (`Package.IsUpdateMajor`, relative to the installed version). Managers report only their
+newest version, so hiding alone would also hide every later release of the installed major; for
+managers that can update to an exact version, `PackageManager.GetAvailableUpdates` instead offers
+the newest stable version within the installed major, marked with
+`OverridenInstallationOptions.PinUpdateToNewVersion`, and `UpdateVersionPin` installs exactly that
+version (as an explicit `Version`, which WinGet passes as `--version`).
+
+- `CanUpdateToExactVersion` declares whether a manager's update can target a version. It defaults
+  to custom versions + versions on update + version listing; WinGet narrows it to system winget,
+  because bundled Pinget's `upgrade` has no `--version`. Without it the major update is only hidden.
+- `IsEligibleUpdateTarget` rejects withdrawn releases (`false`) or stops the choice when their
+  status is unknown (`null`): NuGet V3 checks the registration leaf, Cargo skips yanked crates.
+  Override it when a manager's version list includes releases its own update selection excludes.
+- `UpgradablePackagesLoader.ResolveSkippedMajorUpdateAsync` re-resolves a listed row before an
+  update is launched or after its options are saved, and every update is checked again by
+  `RefusalBeforeStart` before any pre-operation runs.
 
 ## Build & Test
 
@@ -251,6 +312,18 @@ dotnet publish src/UniGetUI.Avalonia/UniGetUI.Avalonia.csproj /p:Configuration=R
 - Build generates secrets via `src/UniGetUI.Avalonia/Infrastructure/generate-secrets.ps1` and integrity tree via `scripts/generate-integrity-tree.ps1`
 - Self-contained, publish-trimmed (partial), Windows App SDK self-contained
 - Tests use **xUnit** (`[Fact]`, `Assert.*`)
+
+The `.NET Tests` workflow runs the Windows build/tests, the full-trim NativeAOT publish and,
+on Ubuntu, the Linux and macOS self-update tests (`test-linux-self-update`, which the Windows
+job reports as skipped) in parallel jobs. `test-codebase` is the aggregate gate and requires
+all three to succeed.
+The test job builds once with two MSBuild nodes and runs the complete suite with
+`--no-build /m:1`; keep test hosts serial because suites share on-disk state. NativeAOT
+already checks full trimming, so do not add a second warning-only full-trim publish.
+
+Do not copy and rename system executables to create process-test fixtures: endpoint
+protection flags launching these copies as executable masquerading. Process tests
+must not terminate unrelated processes on the developer's machine.
 
 ### Formatting (required before every commit)
 

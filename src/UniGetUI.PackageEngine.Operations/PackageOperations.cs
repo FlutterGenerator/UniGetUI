@@ -16,6 +16,7 @@ using UniGetUI.PackageEngine.Operations.Reboot;
 using UniGetUI.PackageEngine.PackageClasses;
 using UniGetUI.PackageEngine.PackageLoader;
 using UniGetUI.PackageEngine.Serializable;
+using UniGetUI.PackageEngine.Structs;
 using UniGetUI.PackageOperations;
 using BrokerClient = Devolutions.Now.Policy.Client.BrokerClient;
 using BrokerClientErrorKind = Devolutions.Now.Policy.Client.BrokerClientErrorKind;
@@ -83,10 +84,31 @@ namespace UniGetUI.PackageEngine.Operations
         public readonly IPackage Package;
         public readonly InstallOptions Options;
         public readonly OperationType Role;
+        private readonly UninstallPackageOperation? _uninstallBeforeReinstall;
+        private readonly UninstallPackageOperation? _uninstallPrerequisite;
+        internal static TimeSpan ReinstallCheckTimeout { get; set; } = TimeSpan.FromSeconds(60);
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<
+            string,
+            Lazy<Task<string?>>
+        > _reinstallChecks = new();
+        private bool _reinstallsThisAttempt;
+        private readonly bool _autoPinned;
+        private OperationType CommandRole => _reinstallsThisAttempt ? OperationType.Install : Role;
+
+        internal void AdoptReinstallStepFailure()
+        {
+            if (_uninstallBeforeReinstall?.FailedBecauseApplicationRunning is not true)
+                return;
+            FailedBecauseApplicationRunning = true;
+            Metadata.FailureMessage = _uninstallBeforeReinstall.Metadata.FailureMessage;
+        }
+        internal bool IsReinstallStep { get; init; }
         public bool FailedBecauseApplicationRunning { get; private set; }
         public Task SuccessHandled { get; private set; } = Task.CompletedTask;
         private IReadOnlyList<string> _closeRunningAppProcessNames = [];
         private readonly List<string> _brokerKillBeforeOperationAdded = [];
+        private readonly string _genericFailureTitle;
+        private readonly string _genericFailureMessage;
 
         protected abstract Task HandleSuccess();
         protected abstract Task HandleFailure();
@@ -119,10 +141,50 @@ namespace UniGetUI.PackageEngine.Operations
             )
         {
             Package = package;
-            Options = options;
             Role = role;
+            if (role is OperationType.Install)
+                _uninstallPrerequisite = req as UninstallPackageOperation;
+            if (role is OperationType.Update)
+            {
+                var unpinned = options.WithoutSavedVersion();
+                options = UpdateVersionPin.Apply(package, unpinned, role);
+                _autoPinned = !ReferenceEquals(options, unpinned);
+            }
+            if (ReinstallsOnUpdate(package, options, role))
+            {
+                Options = PinReinstallVersion(package, options);
+                Logger.Info(
+                    $"Queuing {package} version {package.VersionString} for uninstall before it is reinstalled as version {package.NewVersionString}..."
+                );
+                var uninstallOptions = options.Copy();
+                uninstallOptions.RemoveDataOnUninstall = false;
+                uninstallOptions.KillBeforeOperation = [];
+                _uninstallBeforeReinstall = new UninstallPackageOperation(
+                    package,
+                    uninstallOptions
+                )
+                {
+                    IsReinstallStep = true,
+                };
+                OverridenInstallationOptions? overridesBeforeUninstall = null;
+                _uninstallBeforeReinstall.OperationStarting += (_, _) =>
+                    overridesBeforeUninstall ??= package.OverridenOptions;
+                _uninstallBeforeReinstall.OperationSucceeded += (_, _) =>
+                {
+                    if (overridesBeforeUninstall is { } overrides)
+                        package.OverridenOptions = overrides;
+                };
+                _uninstallBeforeReinstall.OperationFailed += (_, _) => AdoptReinstallStepFailure();
+                _reinstallsThisAttempt = true;
+            }
+            else
+            {
+                Options = options;
+            }
 
             Initialize();
+            _genericFailureTitle = Metadata.FailureTitle;
+            _genericFailureMessage = Metadata.FailureMessage;
 
             Enqueued += (_, _) =>
             {
@@ -132,7 +194,6 @@ namespace UniGetUI.PackageEngine.Operations
                     (Options.SkipHashCheck && Role is not OperationType.Uninstall),
                     Package.OverridenOptions.Scope ?? Options.InstallationScope
                 );
-
                 Package.SetTag(PackageTag.OnQueue);
             };
             StatusChanged += (_, status) =>
@@ -237,6 +298,15 @@ namespace UniGetUI.PackageEngine.Operations
                         $"Retry mode {retryMode} is not supported in this context"
                     );
             }
+            if (
+                _uninstallBeforeReinstall is not null
+                && _uninstallBeforeReinstall.Status is not OperationStatus.Succeeded
+            )
+            {
+                _uninstallBeforeReinstall.Options.RunAsAdministrator |= Options.RunAsAdministrator;
+                _uninstallBeforeReinstall.Options.InteractiveInstallation |=
+                    Options.InteractiveInstallation;
+            }
             Metadata.OperationInformation =
                 "Retried package operation for Package="
                 + Package.Id
@@ -255,7 +325,7 @@ namespace UniGetUI.PackageEngine.Operations
             var operationParameters = Package.Manager.OperationHelper.GetParameters(
                 Package,
                 Options,
-                Role
+                CommandRole
             );
             var callVector = Package.Manager.Status.OperationCallArgs;
 
@@ -348,6 +418,15 @@ namespace UniGetUI.PackageEngine.Operations
                 }
             );
 
+            if (IsReinstallStep && ShouldUseAgentBroker())
+            {
+                Line(
+                    "The Devolutions Agent was enabled after this update was queued; the package was left installed. Retry the update to run it through the Agent.",
+                    LineType.Error
+                );
+                return OperationVeredict.Failure;
+            }
+
             if (!ShouldUseAgentBroker())
             {
                 if (!Package.Manager.Capabilities.SerializesOperations)
@@ -383,6 +462,7 @@ namespace UniGetUI.PackageEngine.Operations
 
                 try
                 {
+                    RefreshProcessEnvironment();
                     return await PerformLocalOperation();
                 }
                 finally
@@ -400,7 +480,7 @@ namespace UniGetUI.PackageEngine.Operations
             {
                 try
                 {
-                    var result = await managed.TryPerformAsync(Package, Options, Role,
+                    var result = await managed.TryPerformAsync(Package, Options, CommandRole,
                         message => Line(message, LineType.Information), ReportProgress, CancellationToken);
                     if (result is not null)
                         return result.Value;
@@ -457,7 +537,7 @@ namespace UniGetUI.PackageEngine.Operations
             _brokerStreamedOutput = null;
             Line("Routing operation through Devolutions Agent broker...", LineType.Information);
 
-            if (BrokerRequestBuilder.IsUnsupportedAllowClobberRetry(Package, Role))
+            if (BrokerRequestBuilder.IsUnsupportedAllowClobberRetry(Package, CommandRole))
             {
                 Line("The module conflicts with commands that are already installed; the broker cannot retry with -AllowClobber.", LineType.Error);
                 return FailWith(new BrokerFailureDescription(
@@ -471,8 +551,8 @@ namespace UniGetUI.PackageEngine.Operations
             // machine-scope or elevation-requiring installers) before deciding the requested
             // elevation, mirroring the local execution path where this runs as part of
             // building the process parameters.
-            Package.Manager.OperationHelper.ApplyElevationRequirements(Package, Options, Role);
-            Package.Manager.OperationHelper.ApplyOperationOverrides(Package, Options, Role);
+            Package.Manager.OperationHelper.ApplyElevationRequirements(Package, Options, CommandRole);
+            Package.Manager.OperationHelper.ApplyOperationOverrides(Package, Options, CommandRole);
 
             bool requestElevated = RequiresAdminRights();
             _ranElevated = requestElevated ? 1 : 0;
@@ -501,7 +581,7 @@ namespace UniGetUI.PackageEngine.Operations
             PackageOperationRequest request;
             try
             {
-                request = BrokerRequestBuilder.Build(Package, Options, Role, effectiveInstallLocation);
+                request = BrokerRequestBuilder.Build(Package, Options, CommandRole, effectiveInstallLocation);
             }
             catch (BrokerRequestValidationException ex)
             {
@@ -697,7 +777,7 @@ namespace UniGetUI.PackageEngine.Operations
             var capturedOutput = new List<string>();
             _brokerStreamedOutput = capturedOutput;
             var stdout = new StreamedOutputLineBuffer(this, LineType.Information, capturedOutput);
-            var stderr = new StreamedOutputLineBuffer(this, LineType.Error, capturedOutput);
+            var stderr = new StreamedOutputLineBuffer(this, LineType.StandardError, capturedOutput);
 
             await using (channel.ConfigureAwait(false))
             {
@@ -1138,19 +1218,34 @@ namespace UniGetUI.PackageEngine.Operations
         {
             var veredict = Package.Manager.OperationHelper.GetResult(
                 Package,
-                Role,
+                CommandRole,
                 Output,
-                ReturnCode
+                ReturnCode,
+                Options
             );
 
             FailedBecauseApplicationRunning = false;
+            Metadata.FailureTitle = _genericFailureTitle;
+            Metadata.FailureMessage = _genericFailureMessage;
             if (veredict is OperationVeredict.Failure)
             {
-                if (Role is OperationType.Update)
+                if (
+                    Package.Manager.OperationHelper.GetFailureExplanation(
+                        Package,
+                        CommandRole,
+                        Output,
+                        ReturnCode,
+                        Options
+                    )
+                    is { Length: > 0 } explanation
+                )
+                    Metadata.FailureMessage = explanation;
+                if (CommandRole is OperationType.Update)
                     ExplainNotApplicableUpdate(Output, ReturnCode);
                 ExplainInstallerHashMismatch(ReturnCode);
                 ExplainApplicationCurrentlyRunning(Output, ReturnCode);
                 ExplainFileInUse(Output);
+                ExplainUninstalledByTheReinstall();
             }
 
             return Task.FromResult(veredict);
@@ -1271,6 +1366,15 @@ namespace UniGetUI.PackageEngine.Operations
                     )
                 );
             }
+            if (_uninstallBeforeReinstall is not null)
+            {
+                bool uninstalled =
+                    _uninstallBeforeReinstall.Status is OperationStatus.Succeeded
+                    || IsKnownToBeUninstalled(Package);
+                _reinstallsThisAttempt = uninstalled || !IsBrokerEligible(Package);
+                if (_reinstallsThisAttempt && !uninstalled)
+                    ops.Add(new InnerOperation(_uninstallBeforeReinstall, mustSucceed: true));
+            }
             return ops;
         }
 
@@ -1288,6 +1392,32 @@ namespace UniGetUI.PackageEngine.Operations
                 new Dictionary<string, object?> { { "package", Package.Name } }
             );
 #endif
+        }
+
+        private void ExplainUninstalledByTheReinstall()
+        {
+            UninstallPackageOperation? uninstall = Role is OperationType.Update
+                ? _uninstallBeforeReinstall
+                : _uninstallPrerequisite;
+            if (CommandRole is not OperationType.Install || uninstall?.Status is not OperationStatus.Succeeded)
+                return;
+
+            string version = Options.Version.Length > 0 ? Options.Version
+                : Package.IsUpgradable ? Package.NewVersionString
+                : "";
+            string uninstalled = version.Length > 0
+                ? CoreTools.Translate(
+                    "{package} was uninstalled so that version {version} could be installed, but the installation failed, so {package} is no longer installed. Retry, or install it again.",
+                    new Dictionary<string, object?> { { "package", Package.Name }, { "version", version } }
+                )
+                : CoreTools.Translate(
+                    "{package} was uninstalled so that it could be installed again, but the installation failed, so {package} is no longer installed. Retry, or install it again.",
+                    new Dictionary<string, object?> { { "package", Package.Name } }
+                );
+            Metadata.FailureMessage =
+                Metadata.FailureMessage == _genericFailureMessage
+                    ? uninstalled
+                    : $"{uninstalled} {Metadata.FailureMessage}";
         }
 
         private void ExplainFileInUse(List<string> output)
@@ -1309,6 +1439,24 @@ namespace UniGetUI.PackageEngine.Operations
 
             if (!winget.ReportedUpdateNotApplicable(output, returnCode))
                 return;
+
+            if (winget.ReportedDifferentInstallTechnology(output))
+            {
+                Metadata.FailureMessage = CoreTools.Translate(
+                    "The new version of {package} is installed differently from the one you have. Turn on \"Uninstall, then reinstall when updated\" for it in its installation options, then update it again",
+                    new Dictionary<string, object?> { { "package", Package.Name } }
+                );
+                return;
+            }
+
+            if (winget.ReportedUnconfirmedUpgradeLookup(Package))
+            {
+                Metadata.FailureMessage = CoreTools.Translate(
+                    "{package} could not be updated because its package source was busy or unreachable. Try again in a few minutes",
+                    new Dictionary<string, object?> { { "package", Package.Name } }
+                );
+                return;
+            }
 
             Metadata.FailureMessage = CoreTools.Translate(
                 "{package} may already be up to date, or no installer matches this system",
@@ -1361,7 +1509,7 @@ namespace UniGetUI.PackageEngine.Operations
         /// uninstalls nothing.
         /// </summary>
         private string? GetBrokerEffectiveInstallLocation() =>
-            GetBrokerInstallLocation(Package, Options, Role);
+            GetBrokerInstallLocation(Package, Options, CommandRole);
 
         /// <summary>
         /// The install location a brokered operation sends for the given package, options and role.
@@ -1398,7 +1546,7 @@ namespace UniGetUI.PackageEngine.Operations
                 var installedMatches = await Task.Run(() =>
                     Package
                         .Manager.GetInstalledPackages()
-                        .Where(candidate => candidate.IsEquivalentTo(Package))
+                        .Where(candidate => candidate.IsSamePackageAs(Package))
                         .ToArray()
                 );
 
@@ -1493,6 +1641,197 @@ namespace UniGetUI.PackageEngine.Operations
             return l;
         }
 
+        public static bool SupportsUninstallBeforeUpdate(IPackage package) =>
+            package.Manager.Capabilities.CanUninstall
+            && package.Manager.Capabilities.CanReinstallOnUpdate
+            && (
+                !package.Manager.Capabilities.ReinstallsOnUpdateOnlyGlobalPackages
+                || package.OverridenOptions.Scope == PackageScope.Global
+            )
+            && !IsBrokerEligible(package);
+
+        public static bool IsLeftOutOfBulkUpdates(IPackage package, InstallOptions options) =>
+            package.RequiresReinstallToUpdate && !options.UninstallBeforeUpdate;
+
+        public static async Task<IReadOnlyList<IPackage>> WithoutUpdatesLeftOutOfBulkAsync(
+            IEnumerable<IPackage> packages
+        )
+        {
+            List<IPackage> kept = [];
+            foreach (IPackage package in packages)
+            {
+                if (
+                    !package.RequiresReinstallToUpdate
+                    || !IsLeftOutOfBulkUpdates(
+                        package,
+                        await InstallOptionsFactory.LoadApplicableAsync(package)
+                    )
+                )
+                {
+                    kept.Add(package);
+                }
+            }
+
+            return kept;
+        }
+
+        protected override async Task<string?> RefusalBeforeStartAsync()
+        {
+            if (RefusalBeforeStart() is { } refusal)
+                return refusal;
+
+            bool uninstallIsScheduled = Role is OperationType.Update
+                ? _uninstallBeforeReinstall is { Status: not OperationStatus.Succeeded }
+                    && !IsKnownToBeUninstalled(Package)
+                : _uninstallPrerequisite is not null;
+            if (!uninstallIsScheduled || IsBrokerEligible(Package))
+                return null;
+
+            string? reinstallRefusal;
+            try
+            {
+                reinstallRefusal = await GetReinstallCheck(Package, Options)
+                    .WaitAsync(ReinstallCheckTimeout, CancellationToken);
+            }
+            catch (TimeoutException)
+            {
+                reinstallRefusal = CoreTools.Translate(
+                    "{0} was not uninstalled: checking that it could be installed again afterwards took longer than {1} seconds. Try again later.",
+                    Package.Name,
+                    (int)Math.Ceiling(ReinstallCheckTimeout.TotalSeconds)
+                );
+            }
+
+            if (reinstallRefusal is not null)
+                Metadata.FailureMessage = reinstallRefusal;
+            return reinstallRefusal;
+        }
+
+        internal static Task<string?> GetReinstallCheck(IPackage package, InstallOptions options)
+        {
+            string key = string.Join(
+                '\u001f',
+                package.Manager.Name,
+                package.Source.Name,
+                package.Id,
+                package.RequiresReinstallToUpdate,
+                package.OverridenOptions.Scope ?? "",
+                options.Version,
+                options.InstallationScope,
+                options.Architecture,
+                string.Join(' ', options.CustomParameters_Install)
+            );
+            var check = _reinstallChecks.GetOrAdd(
+                key,
+                _ => new Lazy<Task<string?>>(() =>
+                    Task.Run(() => package.Manager.OperationHelper.GetReinstallRefusal(package, options))
+                )
+            );
+            Task<string?> task = check.Value;
+            _ = task.ContinueWith(
+                _ => _reinstallChecks.TryRemove(new KeyValuePair<string, Lazy<Task<string?>>>(key, check)),
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default
+            );
+            return task;
+        }
+
+        private string? RefusalBeforeStart()
+        {
+            if (Package.Manager.Capabilities.ElevatesItself && Settings.Get(Settings.K.ProhibitElevation))
+                return CoreTools.Translate(
+                    "{0} asks for administrator rights on its own to finish this operation, and elevation is prohibited in UniGetUI's settings.",
+                    Package.Manager.DisplayName
+                );
+
+            if (Role is not OperationType.Update)
+                return null;
+
+            if (_autoPinned && Package.NewerVersionIsInstalled())
+                return CoreTools.Translate(
+                    "{0} was not updated to {1}: a newer version is already installed. Reload the updates list.",
+                    Package.Name,
+                    Package.NewVersionString
+                );
+
+            if (!Options.SkipMajorUpdates || (!_autoPinned && UpdateVersionPin.HasHonoredExplicitVersion(Package, Options)))
+                return null;
+
+            if (Package.IsUpdateMajor())
+                return CoreTools.Translate(
+                    "{0} was not updated to {1}: major updates are skipped for this package. Reload the updates list to see an update within the installed major version, or turn off \"Skip major updates\" to install it.",
+                    Package.Name,
+                    Package.NewVersionString
+                );
+
+            if (!Package.IsUpgradable)
+                return CoreTools.Translate(
+                    "{0} was not updated: major updates are skipped for this package and the version to update to is unknown. Update it from the updates list, or request a specific version.",
+                    Package.Name
+                );
+
+            if (Package.OverridenOptions.PinUpdateToNewVersion && !_autoPinned)
+                return CoreTools.Translate(
+                    "{0} was not updated to {1}: {2} cannot install that exact version right now. Reload the updates list.",
+                    Package.Name,
+                    Package.NewVersionString,
+                    Package.Manager.DisplayName
+                );
+
+            return null;
+        }
+
+        private static bool IsKnownToBeUninstalled(IPackage package)
+        {
+            if (InstalledPackagesLoader.Instance is not { IsLoaded: true } installed)
+                return false;
+            if (package.Manager.LastInstalledListingFailed)
+                return false;
+            if (installed.GetEquivalentPackages(package).Count > 0)
+                return false;
+            Logger.Info(
+                $"{package} is no longer installed; the update will install it without uninstalling it first"
+            );
+            return true;
+        }
+
+        private static bool ReinstallsOnUpdate(
+            IPackage package,
+            InstallOptions opts,
+            OperationType role
+        ) =>
+            role is OperationType.Update
+            && (opts.UninstallBeforeUpdate || package.RequiresReinstallToUpdate)
+            && package.IsUpgradable
+            && SupportsUninstallBeforeUpdate(package);
+
+        private static InstallOptions PinReinstallVersion(IPackage package, InstallOptions opts)
+        {
+            var capabilities = package.Manager.Capabilities;
+            var pinned = opts.Copy();
+            pinned.CustomInstallLocation =
+                GetBrokerInstallLocation(package, opts, OperationType.Update) ?? "";
+            package.Manager.OperationHelper.ApplyOperationOverrides(
+                package,
+                pinned,
+                OperationType.Update
+            );
+            if (
+                pinned.Version.Length > 0
+                && (
+                    capabilities.SupportsCustomVersionsOnUpdate
+                    || UpdateVersionPin.HasHonoredExplicitVersion(package, pinned)
+                )
+            )
+                return pinned;
+            pinned.Version =
+                package.IsUpgradable && capabilities.SupportsCustomVersions
+                    ? package.NewVersionString
+                    : "";
+            return pinned;
+        }
+
         private static IReadOnlyList<InnerOperation> _getPostInstallOps(
             IPackage package,
             InstallOptions opts,
@@ -1529,8 +1868,10 @@ namespace UniGetUI.PackageEngine.Operations
                         ? opts.InstallationScope
                         : package.OverridenOptions.Scope;
 
+                bool reinstalls = ReinstallsOnUpdate(package, opts, role);
                 var matches = InstalledPackagesLoader.Instance.Packages.Where(p =>
-                    p.IsEquivalentTo(package)
+                    p.IsSamePackageAs(package)
+                    && !(reinstalls && p.VersionString == package.VersionString)
                     && (
                         string.IsNullOrEmpty(p.OverridenOptions.Scope)
                         || string.IsNullOrEmpty(updatedScope)
@@ -1670,11 +2011,12 @@ namespace UniGetUI.PackageEngine.Operations
             UpgradablePackagesLoader.Instance.Remove(Package);
             InstalledPackagesLoader.Instance.Remove(Package);
 
-            bool explicitVersionRequested =
-                !string.IsNullOrWhiteSpace(Options.Version)
-                && Package.Manager.Capabilities.SupportsCustomVersionsOnUpdate;
-            string targetVersion = explicitVersionRequested
-                ? Options.Version
+            string? honoredVersion = string.IsNullOrWhiteSpace(Options.Version)
+                ? null
+                : UpdateVersionPin.HonoredUpdateVersion(Package, Options);
+            bool explicitVersionRequested = honoredVersion is not null;
+            string targetVersion = honoredVersion is not null
+                ? honoredVersion
                 : string.IsNullOrWhiteSpace(Package.NewVersionString)
                     ? Package.VersionString
                     : Package.NewVersionString;
@@ -1773,6 +2115,13 @@ namespace UniGetUI.PackageEngine.Operations
 
         protected override Task HandleSuccess()
         {
+            if (IsReinstallStep)
+            {
+                if (InstalledPackagesLoader.Instance.GetEquivalentPackage(Package) is { } listed)
+                    InstalledPackagesLoader.Instance.Remove(listed);
+                return Task.CompletedTask;
+            }
+
             Package.SetTag(PackageTag.Default);
             Package.GetAvailablePackage()?.SetTag(PackageTag.Default);
             UpgradablePackagesLoader.Instance.Remove(Package);

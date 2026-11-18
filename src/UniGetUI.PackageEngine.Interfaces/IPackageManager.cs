@@ -4,6 +4,7 @@ using UniGetUI.PackageEngine.Classes.Manager.ManagerHelpers;
 using UniGetUI.PackageEngine.Interfaces.ManagerProviders;
 using UniGetUI.PackageEngine.ManagerClasses.Classes;
 using UniGetUI.PackageEngine.ManagerClasses.Manager;
+using UniGetUI.PackageEngine.Serializable;
 
 namespace UniGetUI.PackageEngine.Interfaces
 {
@@ -48,6 +49,10 @@ namespace UniGetUI.PackageEngine.Interfaces
         /// </summary>
         public int? CompareVersions(string versionA, string versionB);
 
+        public bool CanUpdateToExactVersion { get; }
+
+        public IPackage? ResolveSkippedMajorUpdate(IPackage update, InstallOptions? options = null);
+
         /// <summary>
         /// Initializes the Package Manager (asynchronously). Must be run before using any other method of the manager.
         /// </summary>
@@ -63,11 +68,21 @@ namespace UniGetUI.PackageEngine.Interfaces
         /// </summary>
         public bool IsReady();
 
+        public bool IsInitializing { get; }
+
         /// <summary>
         /// Returns an array of Package objects that the manager lists for the given query. Depending on the manager, the list may
         /// also include similar results. This method is fail-safe and will return an empty array if an error occurs.
         /// </summary>
         public IReadOnlyList<IPackage> FindPackages(string query);
+
+        public IReadOnlyList<IPackage> FindPackages(string query, out bool failed);
+
+        public ManagerHealthRecord GetHealthRecord();
+
+        public bool ExpectsInstalledPackages { get; }
+
+        public IReadOnlyList<ManagerMaintenanceAction> GetMaintenanceActions();
 
         /// <summary>
         /// Returns an array of UpgradablePackage objects that represent the available updates reported by the manager.
@@ -110,5 +125,6 @@ namespace UniGetUI.PackageEngine.Interfaces
         /// <returns></returns>
         public IReadOnlyList<string> FindCandidateExecutableFiles();
         public Tuple<bool, string> GetExecutableFile();
+        public bool HasExecutable() => GetExecutableFile().Item1;
     }
 }

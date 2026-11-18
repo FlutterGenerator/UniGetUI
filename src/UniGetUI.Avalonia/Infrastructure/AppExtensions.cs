@@ -1,9 +1,14 @@
 using Avalonia.Controls;
 using UniGetUI.Avalonia.Views;
 using UniGetUI.Avalonia.Views.Pages.SettingsPages;
+using UniGetUI.Core.Logging;
 using UniGetUI.Core.SettingsEngine;
 using UniGetUI.Core.Tools;
+using UniGetUI.Extensions.Drivers;
 using UniGetUI.Interface.Enums;
+using UniGetUI.Avalonia.ViewModels;
+using UniGetUI.Avalonia.ViewModels.Pages;
+using UniGetUI.Avalonia.Views.Pages;
 
 namespace UniGetUI.Avalonia.Infrastructure;
 
@@ -31,18 +36,47 @@ internal sealed class AppExtension
     public required Func<UserControl> CreateSettingsPage { get; init; }
 
     /// <summary>Starts or stops what it runs in the app, once its setting has changed.</summary>
-    public required Action<bool> ApplyEnabled { get; init; }
+    public required Func<MainWindowViewModel, AppExtensionSession> Start { get; init; }
+    public Action InitializePreferences { get; init; } = () => { };
 
     /// <summary>A few words on how it is doing while on, such as "2 behind"; empty when there is nothing to say.</summary>
     public Func<string> Status { get; init; } = () => "";
 
-    public bool IsEnabled => Settings.Get(EnabledSetting);
+    /// <summary>Whether this extension can run on the current system and, if not, why.</summary>
+    public Func<bool> IsAvailable { get; init; } = () => true;
+    public Func<string> UnavailableReason { get; init; } = () => "";
+    internal Action<bool>? ApplyEnabledOverride { get; init; }
+
+    public bool IsEnabled => IsAvailable() && Settings.Get(EnabledSetting);
+
+    public void ApplyEnabled(bool enabled)
+    {
+        if (ApplyEnabledOverride is { } apply)
+        {
+            apply(enabled);
+            return;
+        }
+        MainWindow.Instance?.SetExtensionEnabled(Page, enabled);
+    }
 
     public void SetEnabled(bool enabled)
     {
+        if (enabled && !IsAvailable())
+        {
+            Logger.Warn($"Cannot enable {Name}: {UnavailableReason()}");
+            return;
+        }
         Settings.Set(EnabledSetting, enabled);
         ApplyEnabled(enabled);
     }
+}
+
+internal sealed class AppExtensionSession(Func<Control> createPage, Action stop, Func<Task>? checkForUpdates = null)
+{
+    private Control? _page;
+    public Control Page => _page ??= createPage();
+    public void Stop() => stop();
+    public Task CheckForUpdatesAsync() => checkForUpdates?.Invoke() ?? Task.CompletedTask;
 }
 
 internal static class AppExtensions
@@ -57,7 +91,7 @@ internal static class AppExtensions
         Page = PageType.GitRepositories,
         SettingsPage = typeof(GitRepositoriesSettings),
         CreateSettingsPage = () => new GitRepositoriesSettings(),
-        ApplyEnabled = enabled => MainWindow.Instance?.SetGitRepositoriesEnabled(enabled),
+        Start = window => window.StartGitRepositories(),
         Status = () => MainWindow.Instance?.GitRepositories is not { } git
             ? ""
             : git.BehindCount > 0
@@ -70,6 +104,86 @@ internal static class AppExtensions
                 },
     };
 
-    /// <summary>Every extension, in the order Settings lists them.</summary>
-    public static IReadOnlyList<AppExtension> All { get; } = [GitRepositories];
+    public static readonly AppExtension AgentSkills = new()
+    {
+        Id = "agent-skills",
+        Name = "Agent Skills",
+        Description = "Discover and manage skills and plugins for AI coding agents",
+        Icon = IconType.Skills,
+        EnabledSetting = Settings.K.EnableAgentSkills,
+        Page = PageType.AgentSkills,
+        SettingsPage = typeof(AgentSkillsSettingsControl),
+        CreateSettingsPage = () => new AgentSkillsSettingsControl(),
+        Start = _ =>
+        {
+            AgentSkillsDependencies.ApplyPinnedUpdateExclusions();
+            var skills = new AgentSkillsViewModel();
+            return new(() => new AgentSkillsPage(skills), skills.Stop, skills.CheckForUpdatesInBackgroundAsync);
+        },
+        InitializePreferences = AgentSkillsDependencies.ApplyPinnedUpdateExclusions,
+    };
+
+    public static readonly AppExtension Drivers = new()
+    {
+        Id = "drivers",
+        Name = "Drivers",
+        Description = "Find and install driver updates offered by Windows Update",
+        Icon = IconType.Drivers,
+        EnabledSetting = Settings.K.EnableDrivers,
+        Page = PageType.Drivers,
+        SettingsPage = typeof(DriversSettings),
+        CreateSettingsPage = () => new DriversSettings(),
+        Start = window => window.StartDrivers(),
+        IsAvailable = () => DriverUpdateService.IsSupported,
+        UnavailableReason = () => CoreTools.Translate("Requires Windows"),
+        Status = () => MainWindow.Instance?.Drivers is not { } drivers
+            ? ""
+            : drivers.UpdateCount switch
+            {
+                0 => drivers.HasScanned && !drivers.HasError ? CoreTools.Translate("Up to date") : "",
+                1 => CoreTools.Translate("1 driver update"),
+                int count => CoreTools.Translate("{0} driver updates", count),
+            },
+    };
+
+#if UNIGETUI_XCODE_EXTENSION
+    public static readonly AppExtension Xcode = new()
+    {
+        Id = "xcode",
+        Name = "Xcode",
+        Description = "Install, update and switch between versions of Xcode",
+        Icon = IconType.Xcode,
+        EnabledSetting = Settings.K.EnableXcode,
+        Page = PageType.Xcode,
+        SettingsPage = typeof(XcodeSettings),
+        CreateSettingsPage = () => new XcodeSettings(),
+        Start = window => window.StartXcode(),
+        IsAvailable = () => XcodePlatform.IsSupported,
+        UnavailableReason = () => CoreTools.Translate("Requires macOS 13 or later"),
+        Status = () => MainWindow.Instance?.Xcode is not { } xcode
+            ? ""
+            : xcode.HasUpdate
+                    ? CoreTools.Translate("Xcode {0} is available", xcode.UpdateVersion)
+                    : xcode.Installed.Count switch
+                    {
+                        0 => xcode.HasLoaded ? CoreTools.Translate("No Xcode installed") : "",
+                        1 => CoreTools.Translate("1 version installed"),
+                        int count => CoreTools.Translate("{0} versions installed", count),
+                    },
+    };
+#endif
+
+    /// <summary>Every extension available on this system, in the order Settings lists them.</summary>
+    public static IReadOnlyList<AppExtension> All { get; } =
+#if UNIGETUI_XCODE_EXTENSION
+        OperatingSystem.IsMacOS() ? [GitRepositories, AgentSkills, Xcode]
+            : OperatingSystem.IsWindows() ? [GitRepositories, AgentSkills, Drivers] : [GitRepositories, AgentSkills];
+#else
+        OperatingSystem.IsWindows() ? [GitRepositories, AgentSkills, Drivers] : [GitRepositories, AgentSkills];
+#endif
+
+    public static void InitializePreferences()
+    {
+        foreach (var extension in All) extension.InitializePreferences();
+    }
 }

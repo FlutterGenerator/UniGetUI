@@ -1,9 +1,9 @@
+using System.Reflection;
 using Avalonia;
 using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Input;
 using Avalonia.Threading;
 using Consolonia.Core.Drawing.PixelBufferImplementation;
-using Consolonia.Fonts;
 using Consolonia.NUnit;
 using NUnit.Framework;
 using UniGetUI.PackageEngine.Operations.History;
@@ -23,16 +23,29 @@ using Avalonia = global::Avalonia;
 /// the screen, the fake system state file.
 /// </summary>
 [NonParallelizable]
-internal abstract class TuiE2ETestBase : ConsoloniaAppTestBase<App>
+internal abstract class TuiE2ETestBase
 {
     protected static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(20);
+    private TuiTestHost? _host;
 
-    protected TuiE2ETestBase() : base(new PixelBufferSize(160, 50))
+    protected UnitTestConsole UITest { get; private set; } = null!;
+
+    [SetUp]
+    public async Task SetUpApp()
     {
-        Args = [];
+        UITest = new UnitTestConsole(new PixelBufferSize(160, 50));
+        _host = new TuiTestHost(UITest, CreateAppBuilder);
+        await _host.StartAsync();
     }
 
-    protected override AppBuilder CreateAppBuilder() => base.CreateAppBuilder().WithConsoleFonts();
+    [TearDown]
+    public async Task TearDownApp()
+    {
+        if (_host is not null) await _host.StopAsync();
+        _host = null;
+    }
+
+    protected virtual AppBuilder CreateAppBuilder() => TuiTestHost.CreateAppBuilder(UITest);
 
     internal static MainWindow Window
         => (MainWindow)((IClassicDesktopStyleApplicationLifetime)Application.Current!.ApplicationLifetime!).MainWindow!;
@@ -122,7 +135,45 @@ internal abstract class TuiE2ETestBase : ConsoloniaAppTestBase<App>
     protected Task Key(Key key, RawModifiers modifiers = RawModifiers.None)
         => UITest.KeyInput(key, (Avalonia.Input.RawInputModifiers)modifiers);
 
-    protected Task Type(string text) => UITest.StringInput(text);
+    // Consolonia renders at 30 fps. UnitTestConsole.WaitRendered waits for two composition
+    // commits, so every key press and typed character in a test cost about 130 ms.
+    // Avalonia 12 reference assemblies hide the render timer, so it is reached by reflection.
+    // The timer reads its interval on every tick, so it can be changed once the app runs.
+    private static readonly Type RenderTimerType =
+        typeof(AvaloniaObject).Assembly.GetType("Avalonia.Rendering.IRenderTimer")
+        ?? throw new InvalidOperationException("Could not find Avalonia's render timer.");
+
+    [SetUp]
+    public void UseFastRenderLoop()
+    {
+        object locator = typeof(AvaloniaLocator).GetProperty("Current", BindingFlags.Static | BindingFlags.Public)?.GetValue(null)
+                         ?? throw new InvalidOperationException("Could not find Avalonia's service locator.");
+        object? timer = locator.GetType().GetMethod("GetService", [typeof(Type)])?.Invoke(locator, [RenderTimerType]);
+        if (timer is null) return;
+        FieldInfo interval = timer.GetType().GetField("_timeBetweenTicks", BindingFlags.Instance | BindingFlags.NonPublic)
+                             ?? throw new InvalidOperationException($"Could not find the tick interval of {timer.GetType()}.");
+        interval.SetValue(timer, TimeSpan.FromMilliseconds(2));
+    }
+
+    // UnitTestConsole.StringInput sleeps 2 x 50 ms per character, which made typing a path cost
+    // seconds. Each character is sent the way KeyInput sends a key: press, release, render.
+    private static readonly FieldInfo KeyEventField =
+        typeof(UnitTestConsole).GetField(nameof(UnitTestConsole.KeyEvent), BindingFlags.Instance | BindingFlags.NonPublic)
+        ?? throw new InvalidOperationException("Could not find UnitTestConsole.KeyEvent.");
+
+    protected async Task Type(string text)
+    {
+        var keyEvent = (Action<Key, char, Avalonia.Input.RawInputModifiers, bool, ulong, bool>?)KeyEventField.GetValue(UITest);
+        foreach (char c in text)
+        {
+            ulong timestamp = (ulong)Environment.TickCount64;
+            keyEvent?.Invoke(Avalonia.Input.Key.None, c, Avalonia.Input.RawInputModifiers.None, true, timestamp, true);
+            await Task.Yield();
+            keyEvent?.Invoke(Avalonia.Input.Key.None, c, Avalonia.Input.RawInputModifiers.None, false, timestamp + 1, true);
+            await Task.Yield();
+            await UITest.WaitRendered();
+        }
+    }
 
     /// <summary>Puts keyboard focus back on the page's main control (what Esc does from a field).</summary>
     protected async Task EnterPage()

@@ -32,6 +32,11 @@ public static class IpcAppPages
         "catalog",
         "catalog-editor",
         "git-repositories",
+        "agent-skills",
+        .. OperatingSystem.IsWindows() ? ["drivers"] : Array.Empty<string>(),
+#if UNIGETUI_XCODE_EXTENSION
+        .. OperatingSystem.IsMacOS() ? ["xcode"] : Array.Empty<string>(),
+#endif
         "settings",
         "managers",
         "own-log",
@@ -56,6 +61,11 @@ public static class IpcAppPages
             "catalog" => normalized,
             "catalog-editor" => normalized,
             "git-repositories" => normalized,
+            "agent-skills" => normalized,
+            "drivers" when OperatingSystem.IsWindows() => normalized,
+#if UNIGETUI_XCODE_EXTENSION
+            "xcode" when OperatingSystem.IsMacOS() => normalized,
+#endif
             "settings" => normalized,
             "managers" => normalized,
             "own-log" => normalized,
@@ -86,6 +96,11 @@ public static class IpcAppPages
             "Catalog" => "catalog",
             "CatalogEditor" => "catalog-editor",
             "GitRepositories" => "git-repositories",
+            "AgentSkills" => "agent-skills",
+            "Drivers" => "drivers",
+#if UNIGETUI_XCODE_EXTENSION
+            "Xcode" => "xcode",
+#endif
             "Settings" => "settings",
             "Managers" => "managers",
             "OwnLog" => "own-log",

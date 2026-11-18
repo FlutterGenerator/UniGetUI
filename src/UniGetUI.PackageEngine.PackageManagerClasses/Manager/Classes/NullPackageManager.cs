@@ -35,6 +35,10 @@ namespace UniGetUI.PackageEngine.Classes.Manager
 
         public bool IdentifiersAreQuotedOnCommandLine => false;
 
+        public bool CanUpdateToExactVersion => false;
+
+        public IPackage? ResolveSkippedMajorUpdate(IPackage update, InstallOptions? options = null) => update;
+
         public int? CompareVersions(string versionA, string versionB)
         {
             var parsedA = CoreTools.VersionStringToStruct(versionA);
@@ -106,6 +110,17 @@ namespace UniGetUI.PackageEngine.Classes.Manager
 
         public IReadOnlyList<IPackage> FindPackages(string query) =>
             throw new NotImplementedException();
+
+        public IReadOnlyList<IPackage> FindPackages(string query, out bool failed) =>
+            throw new NotImplementedException();
+
+        public ManagerHealthRecord GetHealthRecord() => new();
+
+        public bool ExpectsInstalledPackages => false;
+
+        public bool IsInitializing => false;
+
+        public IReadOnlyList<ManagerMaintenanceAction> GetMaintenanceActions() => [];
 
         public IReadOnlyList<IPackage> GetAvailableUpdates() => throw new NotImplementedException();
 
@@ -186,7 +201,8 @@ namespace UniGetUI.PackageEngine.Classes.Manager
             IPackage package,
             OperationType operation,
             IReadOnlyList<string> processOutput,
-            int returnCode
+            int returnCode,
+            InstallOptions? options = null
         ) => throw new NotImplementedException();
 
         public void ApplyElevationRequirements(
@@ -200,5 +216,15 @@ namespace UniGetUI.PackageEngine.Classes.Manager
             InstallOptions options,
             OperationType operation
         ) => throw new NotImplementedException();
+
+        public string? GetFailureExplanation(
+            IPackage package,
+            OperationType operation,
+            IReadOnlyList<string> processOutput,
+            int returnCode,
+            InstallOptions? options = null
+        ) => null;
+
+        public string? GetReinstallRefusal(IPackage package, InstallOptions options) => null;
     }
 }

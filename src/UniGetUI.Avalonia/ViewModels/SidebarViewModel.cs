@@ -28,10 +28,71 @@ public partial class SidebarViewModel : ViewModelBase
 
     partial void OnGitRepositoriesEnabledChanged(bool value)
     {
-        NavigationPages = NavigationPageOrder.Get(SoftwareCatalogEnabled, value);
+        NavigationPages = GetNavigationPages(gitRepositoriesEnabled: value);
         if (value) return;
         GitRepositoriesBadgeCount = 0;
         GitRepositoriesIsLoading = false;
+    }
+
+#if UNIGETUI_XCODE_EXTENSION
+    // Keep a saved preference without starting the extension on an unsupported system.
+    [ObservableProperty]
+    private bool _xcodeEnabled = XcodePlatform.IsSupported && Settings.Get(Settings.K.EnableXcode);
+
+    partial void OnXcodeEnabledChanged(bool value)
+    {
+        NavigationPages = GetNavigationPages(xcodeEnabled: value);
+        if (value) return;
+        XcodeBadgeCount = 0;
+        XcodeIsLoading = false;
+    }
+#endif
+
+    [ObservableProperty]
+    private bool _driversEnabled = AppExtensions.Drivers.IsEnabled;
+
+    partial void OnDriversEnabledChanged(bool value)
+    {
+        NavigationPages = GetNavigationPages(driversEnabled: value);
+        if (value) return;
+        DriversBadgeCount = 0;
+        DriversIsLoading = false;
+    }
+
+    private PageType[] GetNavigationPages(
+        bool? gitRepositoriesEnabled = null,
+        bool? agentSkillsEnabled = null,
+        bool? xcodeEnabled = null,
+        bool? driversEnabled = null) =>
+#if UNIGETUI_XCODE_EXTENSION
+        NavigationPageOrder.Get(
+            SoftwareCatalogEnabled,
+            gitRepositoriesEnabled ?? GitRepositoriesEnabled,
+            agentSkillsEnabled ?? AgentSkillsEnabled,
+            xcodeEnabled ?? XcodeEnabled,
+            driversEnabled ?? DriversEnabled);
+#else
+        NavigationPageOrder.Get(
+            SoftwareCatalogEnabled,
+            gitRepositoriesEnabled ?? GitRepositoriesEnabled,
+            agentSkillsEnabled ?? AgentSkillsEnabled,
+            driversEnabled: driversEnabled ?? DriversEnabled);
+#endif
+
+    [ObservableProperty]
+    private bool _agentSkillsEnabled = Settings.Get(Settings.K.EnableAgentSkills);
+
+    partial void OnAgentSkillsEnabledChanged(bool value)
+        => NavigationPages = GetNavigationPages(agentSkillsEnabled: value);
+
+    public void SetExtensionEnabled(PageType page, bool enabled)
+    {
+        if (page == PageType.GitRepositories) GitRepositoriesEnabled = enabled;
+        if (page == PageType.AgentSkills) AgentSkillsEnabled = enabled;
+        if (page == PageType.Drivers) DriversEnabled = enabled && AppExtensions.Drivers.IsAvailable();
+#if UNIGETUI_XCODE_EXTENSION
+        if (page == PageType.Xcode) XcodeEnabled = enabled && XcodePlatform.IsSupported;
+#endif
     }
 
     [ObservableProperty]
@@ -40,13 +101,13 @@ public partial class SidebarViewModel : ViewModelBase
     public void ReorderNavigationPages(IReadOnlyList<PageType> pages)
     {
         NavigationPageOrder.Save(pages);
-        NavigationPages = NavigationPageOrder.Get(SoftwareCatalogEnabled, GitRepositoriesEnabled);
+        NavigationPages = GetNavigationPages();
     }
 
     public void ResetNavigationPages()
     {
         NavigationPageOrder.Reset();
-        NavigationPages = NavigationPageOrder.Get(SoftwareCatalogEnabled, GitRepositoriesEnabled);
+        NavigationPages = GetNavigationPages();
     }
 
     // ─── Badge properties ─────────────────────────────────────────────────────
@@ -74,6 +135,33 @@ public partial class SidebarViewModel : ViewModelBase
 
     [ObservableProperty]
     private bool _gitRepositoriesIsLoading;
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(DriversBadgeText))]
+    [NotifyPropertyChangedFor(nameof(DriversBadgeVisible))]
+    private int _driversBadgeCount;
+
+    public bool DriversBadgeVisible => DriversBadgeCount > 0;
+
+    public string DriversBadgeText => DriversBadgeCount > 99 ? "99+" : DriversBadgeCount.ToString();
+
+    [ObservableProperty]
+    private bool _driversIsLoading;
+
+#if UNIGETUI_XCODE_EXTENSION
+    // Whether a newer Xcode than the newest one installed can be installed; one at most.
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(XcodeBadgeText))]
+    [NotifyPropertyChangedFor(nameof(XcodeBadgeVisible))]
+    private int _xcodeBadgeCount;
+
+    public bool XcodeBadgeVisible => XcodeBadgeCount > 0;
+
+    public string XcodeBadgeText => XcodeBadgeCount > 99 ? "99+" : XcodeBadgeCount.ToString();
+
+    [ObservableProperty]
+    private bool _xcodeIsLoading;
+#endif
 
     // When the count changes, sync the badge visibility
     partial void OnUpdatesBadgeCountChanged(int value) =>
@@ -133,7 +221,7 @@ public partial class SidebarViewModel : ViewModelBase
 
     public SidebarViewModel()
     {
-        _navigationPages = NavigationPageOrder.Get(SoftwareCatalogEnabled, GitRepositoriesEnabled);
+        _navigationPages = GetNavigationPages();
         _wasDocked = Docked;
         _isPaneOpen = Docked && !Settings.Get(Settings.K.CollapseNavMenuOnWideScreen);
     }
@@ -187,9 +275,23 @@ public partial class SidebarViewModel : ViewModelBase
             NavigationRequested?.Invoke(this, page);
     }
 
+    [ObservableProperty]
+    private bool _selfUpdateBadgeVisible;
+
+    [ObservableProperty]
+    private string _checkForUpdatesLabel = CoreTools.Translate("Check for UniGetUI updates");
+
+    public void SetPendingSelfUpdate(string? versionName)
+    {
+        SelfUpdateBadgeVisible = versionName is not null;
+        CheckForUpdatesLabel = versionName is null
+            ? CoreTools.Translate("Check for UniGetUI updates")
+            : CoreTools.Translate("UniGetUI {0} is available", ReleaseNotesLinks.ShortVersion(versionName));
+    }
+
     [RelayCommand]
-    private static Task CheckForUpdates() =>
-        AvaloniaAutoUpdater.CheckAndInstallUpdatesAsync(autoLaunch: false, manualCheck: true);
+    private static void CheckForUpdates() =>
+        _ = AvaloniaAutoUpdater.CheckAndInstallUpdatesAsync(autoLaunch: false, manualCheck: true);
 
     public void SelectNavButtonForPage(PageType page) =>
         SelectedPageType = page;
@@ -202,6 +304,10 @@ public partial class SidebarViewModel : ViewModelBase
             case PageType.Updates: UpdatesIsLoading = isLoading; break;
             case PageType.Installed: InstalledIsLoading = isLoading; break;
             case PageType.GitRepositories: GitRepositoriesIsLoading = isLoading; break;
+            case PageType.Drivers: DriversIsLoading = isLoading; break;
+#if UNIGETUI_XCODE_EXTENSION
+            case PageType.Xcode: XcodeIsLoading = isLoading; break;
+#endif
         }
     }
 }

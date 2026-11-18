@@ -28,7 +28,7 @@ namespace UniGetUI.PackageEngine.Managers.VcpkgManager
             Dependencies =
             [
                 // GIT is required for vcpkg updates to work
-                VcpkgGitDependency.Create(),
+                GitDependency.Create(),
             ];
 
             Capabilities = new ManagerCapabilities
@@ -65,6 +65,7 @@ namespace UniGetUI.PackageEngine.Managers.VcpkgManager
             {
                 Id = "vcpkg",
                 Name = "vcpkg",
+                SetupGuide = "PACKAGE_MANAGERS.md#vcpkg",
                 Description = CoreTools.Translate(
                     "A popular C/C++ library manager. Full of C/C++ libraries and other C/C++-related utilities<br>Contains: <b>C/C++ libraries and related utilities</b>"
                 ),

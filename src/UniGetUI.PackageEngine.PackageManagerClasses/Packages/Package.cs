@@ -75,6 +75,7 @@ namespace UniGetUI.PackageEngine.PackageClasses
 
         public virtual bool HasConcreteVersion => true;
         public bool InstalledVersionIsUnverified { get; init; }
+        public bool RequiresReinstallToUpdate { get; init; }
         public CoreTools.Version NormalizedVersion { get; }
         public CoreTools.Version NormalizedNewVersion { get; }
         public bool IsPopulated { get; set; }
@@ -410,6 +411,23 @@ namespace UniGetUI.PackageEngine.PackageClasses
             return changed >= level;
         }
 
+        public virtual bool IsUpdateMajor()
+        {
+            if (
+                !IsUpgradable
+                || !VersionString.AsSpan().ContainsAnyInRange('0', '9')
+                || !NewVersionString.AsSpan().ContainsAnyInRange('0', '9')
+            )
+                return false;
+
+            if (NormalizedVersion != CoreTools.Version.Null && NormalizedNewVersion != CoreTools.Version.Null)
+                return HighestChangedVersionComponent() == 1;
+
+            return CoreTools.GetMajorVersion(VersionString) is { } installedMajor
+                && CoreTools.GetMajorVersion(NewVersionString) is { } newMajor
+                && installedMajor != newMajor;
+        }
+
         public virtual Task<InstallOptions> GetInstallOptions() =>
             InstallOptionsFactory.LoadApplicableAsync(this);
 
@@ -458,7 +476,7 @@ namespace UniGetUI.PackageEngine.PackageClasses
                     "Winget" => p.Source.Name switch
                     {
                         "Steam" => p
-                            .Id.ToLower()
+                            .Id.ToLowerInvariant()
                             .Split("\\")[^1]
                             .Replace("steam app ", "steam-")
                             .Trim(),
@@ -488,7 +506,7 @@ namespace UniGetUI.PackageEngine.PackageClasses
             }
 
             return iconId
-                .ToLower()
+                .ToLowerInvariant()
                 .Replace('_', '-')
                 .Replace('.', '-')
                 .Replace(' ', '-')

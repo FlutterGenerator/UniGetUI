@@ -10,6 +10,7 @@ using UniGetUI.PackageEngine.Classes.Manager;
 using UniGetUI.PackageEngine.Classes.Manager.Classes;
 using UniGetUI.PackageEngine.Classes.Manager.ManagerHelpers;
 using UniGetUI.PackageEngine.Enums;
+using UniGetUI.PackageEngine.Interfaces;
 using UniGetUI.PackageEngine.ManagerClasses.Classes;
 using UniGetUI.PackageEngine.ManagerClasses.Manager;
 using UniGetUI.PackageEngine.PackageClasses;
@@ -88,6 +89,8 @@ public partial class Cargo : PackageManager
         {
             Id = "cargo",
             Name = "Cargo",
+            SetupGuide = "PACKAGE_MANAGERS.md#cargo",
+            InstallCommands = new(Windows: "winget install --exact --id Rustlang.Rustup"),
             Description = CoreTools.Translate(
                 "The Rust package manager.<br>Contains: <b>Rust libraries and programs written in Rust</b>"
             ),
@@ -190,6 +193,9 @@ public partial class Cargo : PackageManager
         path = _executablePath;
         callArguments = "";
     }
+
+    protected override bool? IsEligibleUpdateTarget(IPackage update, string version) =>
+        CratesIOClient.GetManifest(update.Id).Item2.versions.Any(release => release.num == version && !release.yanked);
 
     public override int? CompareVersions(string versionA, string versionB)
     {

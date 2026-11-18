@@ -28,9 +28,9 @@ internal sealed class WinGetPkgOperationHelper : BasePkgOperationHelper
         return $"--id {Selector(package.Id.TrimEnd('…'), "identifier")}";
     }
 
-    private static string GetSelectorPiece(IPackage package)
+    private static string GetSelectorPiece(IPackage package, OperationType operation)
     {
-        if (GetSelectedLocalIdentifier(package) is { } localIdentifier)
+        if (operation is not OperationType.Install && GetSelectedLocalIdentifier(package) is { } localIdentifier)
             return $"--id {Selector(localIdentifier, "local identifier")} --exact";
 
         return GetIdNamePiece(package);
@@ -39,9 +39,10 @@ internal sealed class WinGetPkgOperationHelper : BasePkgOperationHelper
     private static string? GetSelectedLocalIdentifier(IPackage package) =>
         package.OverridenOptions.WinGet_UseLocalIdentifier ? GetFallbackIdentifier(package) : null;
 
-    private static bool DropsArchAndScope(IPackage package) =>
+    private static bool DropsArchAndScope(IPackage package, OperationType? operation = null) =>
         package.OverridenOptions.WinGet_DropArchAndScope
-        || GetSelectedLocalIdentifier(package) is not null;
+        || (package.RequiresReinstallToUpdate && operation is not OperationType.Uninstall)
+        || (operation is not OperationType.Install && GetSelectedLocalIdentifier(package) is not null);
 
     private static bool OperationIsBrokered(IPackage package) =>
         Settings.Get(Settings.K.UseAgentBroker) && !package.Source.IsVirtualManager;
@@ -70,9 +71,13 @@ internal sealed class WinGetPkgOperationHelper : BasePkgOperationHelper
     public WinGetPkgOperationHelper(WinGet manager)
         : base(manager) { }
 
-    internal static string? GetEffectiveScope(IPackage package, InstallOptions options)
+    internal static string? GetEffectiveScope(
+        IPackage package,
+        InstallOptions options,
+        OperationType? operation = null
+    )
     {
-        if (DropsArchAndScope(package))
+        if (DropsArchAndScope(package, operation))
             return null;
 
         return (package.OverridenOptions.Scope ?? options.InstallationScope) switch
@@ -97,10 +102,11 @@ internal sealed class WinGetPkgOperationHelper : BasePkgOperationHelper
     internal static string? GetEffectiveArchitecture(
         IPackage package,
         InstallOptions options,
-        bool forUpdate = false
+        bool forUpdate = false,
+        OperationType? operation = null
     )
     {
-        if (DropsArchAndScope(package))
+        if (DropsArchAndScope(package, operation))
             return null;
 
         string architecture =
@@ -144,7 +150,7 @@ internal sealed class WinGetPkgOperationHelper : BasePkgOperationHelper
             },
         ];
 
-        parameters.AddRange(GetSelectorPiece(package).Split(" "));
+        parameters.AddRange(GetSelectorPiece(package, operation).Split(" "));
         if (!package.Source.IsVirtualManager)
         {
             parameters.AddRange(["--source", package.Source.Name]);
@@ -156,7 +162,7 @@ internal sealed class WinGetPkgOperationHelper : BasePkgOperationHelper
 
         // package.OverridenInstallationOptions.Scope is meaningless in WinGet packages. Default is unspecified, hence the _ => [].
         // WinGet_DropArchAndScope is set after an "update not applicable" failure to retry without the scope/architecture constraints.
-        if (GetEffectiveScope(package, options) is { } scope)
+        if (GetEffectiveScope(package, options, operation) is { } scope)
         {
             parameters.AddRange(["--scope", scope]);
         }
@@ -177,6 +183,20 @@ internal sealed class WinGetPkgOperationHelper : BasePkgOperationHelper
                 ["--version", CoreTools.EscapeCommandLineArgument(options.Version)]
             );
         }
+        else if (
+            operation is OperationType.Update
+            && options.SkipMajorUpdates
+            && UpdateVersionPin.HasExplicitVersion(options)
+        )
+        {
+            if (usePinget)
+                throw new InvalidOperationException(
+                    $"Refusing to update {package.Id} to {options.Version} with Pinget: its upgrade command cannot target a version, so it would install the latest one instead."
+                );
+            parameters.AddRange(
+                ["--version", CoreTools.EscapeCommandLineArgument(options.Version)]
+            );
+        }
 
         if (usePinget && operation is OperationType.Update)
         {
@@ -188,6 +208,10 @@ internal sealed class WinGetPkgOperationHelper : BasePkgOperationHelper
             parameters.Add(options.InteractiveInstallation ? "--interactive" : "--silent");
         }
 
+        PortableArpEntry? portableEntry = operation is OperationType.Uninstall
+            ? null
+            : ReadPortableArpEntry(package);
+
         if (operation is OperationType.Update)
         {
             ApplyOperationOverrides(package, options, operation);
@@ -195,7 +219,7 @@ internal sealed class WinGetPkgOperationHelper : BasePkgOperationHelper
 
             if (!usePinget)
             {
-                var effectiveLocation = GetEffectiveUpdateLocation(package, options);
+                var effectiveLocation = GetEffectiveUpdateLocation(package, options, portableEntry);
                 if (effectiveLocation is not null)
                 {
                     parameters.AddRange(["--location", CoreTools.EscapeCommandLineArgument(effectiveLocation)]);
@@ -219,7 +243,7 @@ internal sealed class WinGetPkgOperationHelper : BasePkgOperationHelper
             if (options.SkipHashCheck)
                 parameters.Add("--ignore-security-hash");
 
-            if (GetEffectiveArchitecture(package, options) is { } architecture)
+            if (GetEffectiveArchitecture(package, options, operation: operation) is { } architecture)
             {
                 parameters.AddRange(["--architecture", architecture]);
             }
@@ -230,14 +254,16 @@ internal sealed class WinGetPkgOperationHelper : BasePkgOperationHelper
                     package,
                     new PendingInstallerTrust(
                         GetRequestedVersion(package, options, operation),
-                        GetEffectiveScope(package, options),
-                        GetEffectiveArchitecture(package, options)
+                        GetEffectiveScope(package, options, operation),
+                        GetEffectiveArchitecture(package, options, operation: operation)
                     )
                 );
             }
         }
 
-        ApplyElevationRequirements(package, options, operation);
+        ApplyInstallerElevationRequirements(package, options, operation);
+        if (!standalone)
+            ApplyPortableLinkElevation(package, operation, portableEntry);
 
         if (!usePinget)
         {
@@ -277,7 +303,247 @@ internal sealed class WinGetPkgOperationHelper : BasePkgOperationHelper
         }
     }
 
+    internal readonly record struct CustomInstallSelectors(
+        IReadOnlyList<string> Unsupported,
+        string? Version,
+        string? Scope,
+        string? Architecture
+    );
+
+    internal static IReadOnlyList<string> SplitWindowsArguments(string commandLine)
+    {
+        List<string> arguments = [];
+        var current = new System.Text.StringBuilder();
+        bool inQuotes = false;
+        bool hasArgument = false;
+        for (int i = 0; i < commandLine.Length; i++)
+        {
+            char c = commandLine[i];
+            if (c == '\\')
+            {
+                int backslashes = 0;
+                while (i < commandLine.Length && commandLine[i] == '\\')
+                {
+                    backslashes++;
+                    i++;
+                }
+
+                if (i < commandLine.Length && commandLine[i] == '"')
+                {
+                    current.Append('\\', backslashes / 2);
+                    if (backslashes % 2 == 1)
+                        current.Append('"');
+                    else
+                        inQuotes = !inQuotes;
+                }
+                else
+                {
+                    current.Append('\\', backslashes);
+                    i--;
+                }
+
+                hasArgument = true;
+            }
+            else if (c == '"')
+            {
+                if (inQuotes && i + 1 < commandLine.Length && commandLine[i + 1] == '"')
+                {
+                    current.Append('"');
+                    i++;
+                }
+                else
+                {
+                    inQuotes = !inQuotes;
+                }
+
+                hasArgument = true;
+            }
+            else if (char.IsWhiteSpace(c) && !inQuotes)
+            {
+                if (hasArgument)
+                    arguments.Add(current.ToString());
+                current.Clear();
+                hasArgument = false;
+            }
+            else
+            {
+                current.Append(c);
+                hasArgument = true;
+            }
+        }
+
+        if (hasArgument)
+            arguments.Add(current.ToString());
+        return arguments;
+    }
+
+    internal static CustomInstallSelectors ReadCustomInstallSelectors(IReadOnlyList<string> customArguments)
+    {
+        IReadOnlyList<string> arguments = SplitWindowsArguments(string.Join(' ', customArguments));
+        List<string> unsupported = [];
+        string? version = null;
+        string? scope = null;
+        string? architecture = null;
+        for (int i = 0; i < arguments.Count; i++)
+        {
+            string argument = arguments[i].Trim();
+            if (!argument.StartsWith('-'))
+                continue;
+
+            int separator = argument.IndexOf('=');
+            string name = (separator > 0 ? argument[..separator] : argument).ToLowerInvariant();
+            string? value = separator > 0 ? argument[(separator + 1)..] : null;
+            switch (name)
+            {
+                case "--version" or "-v":
+                    version = value ?? (i + 1 < arguments.Count ? arguments[++i] : "");
+                    break;
+                case "--scope":
+                    scope = value ?? (i + 1 < arguments.Count ? arguments[++i] : "");
+                    break;
+                case "--architecture" or "-a":
+                    architecture = value ?? (i + 1 < arguments.Count ? arguments[++i] : "");
+                    break;
+                case "--id" or "--name" or "--moniker" or "--query" or "-q" or "--source" or "-s" or "--manifest" or "-m"
+                    or "--installer-type" or "--locale":
+                    unsupported.Add(name);
+                    break;
+            }
+        }
+
+        return new CustomInstallSelectors(unsupported, version, scope, architecture);
+    }
+
+    internal readonly record struct ReinstallTarget(
+        IReadOnlyList<string> Conflicts,
+        string Version,
+        string? Scope,
+        string? Architecture
+    );
+
+    internal static ReinstallTarget ResolveReinstallTarget(
+        InstallOptions options,
+        string? scope,
+        string? architecture
+    )
+    {
+        var custom = ReadCustomInstallSelectors(options.CustomParameters_Install);
+        List<string> conflicts = [.. custom.Unsupported];
+        if (custom.Version is not null && (options.Version.Length > 0 || string.IsNullOrWhiteSpace(custom.Version)))
+            conflicts.Add("--version");
+        string? customScope = custom.Scope?.ToLowerInvariant();
+        string? customArchitecture = custom.Architecture?.ToLowerInvariant();
+        if (customScope is not null && (scope is not null || customScope is not (PackageScope.Machine or PackageScope.User)))
+            conflicts.Add("--scope");
+        if (customArchitecture is not null && (architecture is not null || NativePackageHandler.ToProcessorArchitecture(customArchitecture) is null))
+            conflicts.Add("--architecture");
+
+        return new ReinstallTarget(
+            conflicts,
+            custom.Version ?? options.Version,
+            customScope ?? scope,
+            customArchitecture ?? architecture
+        );
+    }
+
+    public override string? GetReinstallRefusal(IPackage package, InstallOptions options)
+    {
+        if (!NativePackageHandler.CanCheckInstallTargets)
+            return null;
+
+        var target = ResolveReinstallTarget(
+            options,
+            GetEffectiveScope(package, options, OperationType.Install),
+            GetEffectiveArchitecture(package, options, operation: OperationType.Install)
+        );
+        if (target.Conflicts.Count > 0)
+            return CoreTools.Translate(
+                "{0} was not uninstalled: its custom install parameters ({1}) change which package or installer would be installed again, which UniGetUI cannot check beforehand. Remove them, or uninstall and install it separately.",
+                package.Name,
+                string.Join(", ", target.Conflicts)
+            );
+
+        string version = target.Version;
+        bool? installable = NativePackageHandler.CanInstallExactVersion(
+            package,
+            version,
+            target.Scope,
+            target.Architecture
+        );
+        if (installable is not false)
+            return null;
+
+        return version.Length > 0
+            ? CoreTools.Translate(
+                "{0} was not uninstalled: version {1} of {2} could not be found on {3}, so it could not have been installed again afterwards. Reload the package list.",
+                package.Name,
+                version,
+                package.Id,
+                package.Source.Name
+            )
+            : CoreTools.Translate(
+                "{0} was not uninstalled: {1} could not be found on {2}, so it could not have been installed again afterwards. Reload the package list.",
+                package.Name,
+                package.Id,
+                package.Source.Name
+            );
+    }
+
     public override void ApplyElevationRequirements(
+        IPackage package,
+        InstallOptions options,
+        OperationType operation
+    )
+    {
+        ApplyInstallerElevationRequirements(package, options, operation);
+        ApplyPortableLinkElevation(
+            package,
+            operation,
+            operation is OperationType.Uninstall || OperationIsBrokered(package)
+                ? null
+                : ReadPortableArpEntry(package)
+        );
+    }
+
+    internal static void ApplyPortableLinkElevation(
+        IPackage package,
+        OperationType operation,
+        PortableArpEntry? portableEntry
+    )
+    {
+        if (
+            operation is OperationType.Uninstall
+            || package.OverridenOptions.RunAsAdministrator is not null
+            || OperationIsBrokered(package)
+        )
+            return;
+
+        try
+        {
+            if (
+                !PortableUpdateNeedsElevation(
+                    portableEntry,
+                    FindPortableLinksDirectory,
+                    CanCreateSymlinksIn,
+                    CanElevateAsCurrentAccount
+                )
+            )
+                return;
+
+            Logger.Info(
+                $"WinGet portable package {package.Id} has command aliases in the WinGet Links folder, which "
+                    + "this process cannot recreate without elevation; forcing administrator rights so the "
+                    + "aliases are kept"
+            );
+            package.OverridenOptions.RunAsAdministrator = true;
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"Could not check the command aliases of portable package {package.Id}: {ex.Message}");
+        }
+    }
+
+    private static void ApplyInstallerElevationRequirements(
         IPackage package,
         InstallOptions options,
         OperationType operation
@@ -360,13 +626,14 @@ internal sealed class WinGetPkgOperationHelper : BasePkgOperationHelper
         uint uintCode = (uint)returnCode;
         _pendingInstallerTrust.TryGetValue(package, out PendingInstallerTrust? pendingTrust);
         _pendingInstallerTrust.Remove(package);
+        _unconfirmedUpgradeLookups.Remove(package);
 
         if (uintCode is 0x8A150109 or 0x8A15010B)
         {
             if (operation is OperationType.Update or OperationType.Install)
             {
                 // Pending-restart sticks after reboot; don't count it as a phantom no-op (#5042).
-                MarkUpgradeAsDone(package, countTowardStuckLoop: false);
+                MarkUpgradeAsDone(package, countTowardStuckLoop: false, pendingTrust?.Version);
                 if (uintCode is 0x8A150109 && pendingTrust is not null)
                     QueueTrustedInstallerHostsRecord(package, pendingTrust);
             }
@@ -414,8 +681,15 @@ internal sealed class WinGetPkgOperationHelper : BasePkgOperationHelper
                 }
             }
 
-            if (operation is OperationType.Update)
-                SuppressPhantomUpgrade(package);
+            if (operation is OperationType.Update && !ReportedDifferentInstallTechnology(processOutput))
+            {
+                if (!ReportedNoUpgradeCandidate(processOutput, returnCode))
+                    SuppressPhantomUpgrade(package);
+                else if (RecheckUpgrade(package) is UpgradeRecheck.NotOffered)
+                    SuppressPhantomUpgrade(package);
+                else
+                    _unconfirmedUpgradeLookups.AddOrUpdate(package, new object());
+            }
 
             Logger.Warn(
                 $"Update for {package.Id} is not applicable to this system, even without scope/architecture constraints"
@@ -427,7 +701,7 @@ internal sealed class WinGetPkgOperationHelper : BasePkgOperationHelper
         { // Application is already installed
             if (operation is OperationType.Update or OperationType.Install)
                 // Only updates feed the stuck-update counter; installs must not (#5158).
-                MarkUpgradeAsDone(package, countTowardStuckLoop: operation is OperationType.Update);
+                MarkUpgradeAsDone(package, countTowardStuckLoop: operation is OperationType.Update, pendingTrust?.Version);
             return OperationVeredict.Success;
         }
 
@@ -436,7 +710,7 @@ internal sealed class WinGetPkgOperationHelper : BasePkgOperationHelper
             if (operation is OperationType.Update or OperationType.Install)
             {
                 // Only updates feed the stuck-update counter; installs must not (#5158).
-                MarkUpgradeAsDone(package, countTowardStuckLoop: operation is OperationType.Update);
+                MarkUpgradeAsDone(package, countTowardStuckLoop: operation is OperationType.Update, pendingTrust?.Version);
                 if (pendingTrust is not null)
                     QueueTrustedInstallerHostsRecord(package, pendingTrust);
             }
@@ -516,11 +790,17 @@ internal sealed class WinGetPkgOperationHelper : BasePkgOperationHelper
             ? v
             : DefaultStuckUpgradeThreshold;
 
-    private static void MarkUpgradeAsDone(IPackage package, bool countTowardStuckLoop = true)
+    private static void MarkUpgradeAsDone(
+        IPackage package,
+        bool countTowardStuckLoop = true,
+        string? installedVersion = null
+    )
     {
         var options = InstallOptionsFactory.LoadApplicable(package);
         string version;
-        if (package.IsUpgradable)
+        if (installedVersion is { Length: > 0 })
+            version = installedVersion;
+        else if (package.IsUpgradable)
             version = package.NewVersionString;
         else if (options.Version != "")
             version = options.Version;
@@ -547,6 +827,8 @@ internal sealed class WinGetPkgOperationHelper : BasePkgOperationHelper
     private static string GetRequestedVersion(IPackage package, InstallOptions options, OperationType operation)
     {
         if (operation is OperationType.Install && options.Version != "")
+            return options.Version;
+        if (operation is OperationType.Update && options.SkipMajorUpdates && UpdateVersionPin.HasExplicitVersion(options))
             return options.Version;
         return package.IsUpgradable ? package.NewVersionString : package.VersionString;
     }
@@ -637,6 +919,28 @@ internal sealed class WinGetPkgOperationHelper : BasePkgOperationHelper
     internal static bool ReportedInstallerHashMismatch(int returnCode) =>
         (uint)returnCode is 0x8A150011;
 
+    private static readonly string[] DifferentInstallTechnologyMessages =
+    [
+        "install technology is different",
+        "Die Installationstechnologie der angegebenen neueren Version unterscheidet sich von der aktuell installierten Version",
+        "La tecnología de instalación de la versión más reciente especificada es diferente de la versión actual instalada",
+        "La technologie d’installation de la version la plus récente spécifiée est différente de la version actuelle installée",
+        "La tecnologia di installazione della versione più recente specificata è diversa dalla versione corrente installata",
+        "指定された新しいバージョンのインストール テクノロジが、現在インストールされているバージョンと異なります",
+        "지정된 최신 버전의 설치 기술이 현재 설치된 버전과 다릅니다",
+        "A tecnologia de instalação da versão mais recente especificada é diferente da versão atual instalada",
+        "Указанная технология установки более новой версии отличается от текущей установленной версии",
+        "指定的较新版本的安装技术与当前安装的版本不同",
+        "指定之較新版本的安裝技術與目前安裝的版本不同",
+    ];
+
+    internal static bool ReportedDifferentInstallTechnology(IEnumerable<string> processOutput) =>
+        processOutput.Any(line =>
+            DifferentInstallTechnologyMessages.Any(message =>
+                line.Contains(message, StringComparison.OrdinalIgnoreCase)
+            )
+        );
+
     internal static bool ReportedApplicationCurrentlyRunning(int returnCode) =>
         (uint)returnCode is 0x8A150101 or 0x8A150103 or 0x8A150111;
 
@@ -653,6 +957,87 @@ internal sealed class WinGetPkgOperationHelper : BasePkgOperationHelper
                 line.Contains("No applicable installer found", StringComparison.OrdinalIgnoreCase)
                 || line.Contains("No applicable upgrade found", StringComparison.OrdinalIgnoreCase)
             );
+    }
+
+    internal static bool ReportedNoUpgradeCandidate(IReadOnlyList<string> processOutput, int returnCode) =>
+        (uint)returnCode is not 0x8A15002B
+        && processOutput.Any(line =>
+            line.Contains("No applicable upgrade found", StringComparison.OrdinalIgnoreCase)
+        );
+
+    internal enum UpgradeRecheck
+    {
+        StillOffered,
+        SourceUnreadable,
+        NotOffered,
+    }
+
+    internal static Func<ListQuery, ListResponse> ListUpgrades { get; set; } = ListUpgradesWithRepository;
+
+    private static readonly ConditionalWeakTable<IPackage, object> _unconfirmedUpgradeLookups = new();
+
+    internal static bool ReportedUnconfirmedUpgradeLookup(IPackage package) =>
+        _unconfirmedUpgradeLookups.TryGetValue(package, out _);
+
+    private static ListResponse ListUpgradesWithRepository(ListQuery query)
+    {
+        using Repository repository = Repository.Open(PingetPackageDetailsProvider.CreateRepositoryOptions());
+        return repository.List(query);
+    }
+
+    internal static ListQuery CreateUpgradeRecheckQuery(IPackage package)
+    {
+        PackageQuery selector = PingetPackageDetailsProvider.CreateQuery(package);
+        string? localIdentifier = GetSelectedLocalIdentifier(package);
+        return new ListQuery
+        {
+            Id = localIdentifier ?? selector.Id,
+            Name = localIdentifier is null ? selector.Name : null,
+            Exact = localIdentifier is not null || selector.Exact,
+            Source = selector.Source,
+            InstallScope = GetEffectiveScope(
+                package,
+                InstallOptionsFactory.LoadApplicable(package),
+                OperationType.Update
+            ),
+            UpgradeOnly = true,
+            IncludeUnknown = true,
+            IncludePinned = true,
+        };
+    }
+
+    internal static UpgradeRecheck RecheckUpgrade(IPackage package)
+    {
+        try
+        {
+            ListResponse response = ListUpgrades(CreateUpgradeRecheckQuery(package));
+            if (response.Matches.Any(match => !string.IsNullOrEmpty(match.AvailableVersion)))
+            {
+                Logger.Warn(
+                    $"Pinget found no upgrade for {package.Id}, but a second lookup still offers one; "
+                    + "treating the failure as transient and keeping the update listed (issue #5744)"
+                );
+                return UpgradeRecheck.StillOffered;
+            }
+
+            if (response.Warnings.Count > 0)
+            {
+                Logger.Warn(
+                    $"Pinget found no upgrade for {package.Id} and its sources could not be fully read "
+                    + $"({string.Join("; ", response.Warnings)}); keeping the update listed (issue #5744)"
+                );
+                return UpgradeRecheck.SourceUnreadable;
+            }
+
+            return UpgradeRecheck.NotOffered;
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn(
+                $"Could not check again whether {package.Id} has an upgrade: {ex.Message}; keeping the update listed (issue #5744)"
+            );
+            return UpgradeRecheck.SourceUnreadable;
+        }
     }
 
     public static void SuppressPhantomUpgrade(IPackage package)
@@ -751,12 +1136,21 @@ internal sealed class WinGetPkgOperationHelper : BasePkgOperationHelper
     /// location inherited from the manager-wide default stays opt-in behind
     /// WinGetForceLocationOnUpdate so updates don't relocate existing installs (issue #4210).
     /// </summary>
-    internal static string? GetEffectiveUpdateLocation(IPackage package, InstallOptions options)
+    internal static string? GetEffectiveUpdateLocation(IPackage package, InstallOptions options) =>
+        GetEffectiveUpdateLocation(package, options, ReadPortableArpEntry(package));
+
+    private static string? GetEffectiveUpdateLocation(
+        IPackage package,
+        InstallOptions options,
+        PortableArpEntry? portableEntry
+    )
     {
-        var detectedLocation = TryGetPortableInstallLocation(package);
-        if (detectedLocation is not null)
+        if (portableEntry is not null)
         {
-            return detectedLocation;
+            Logger.Info(
+                $"Auto-detected portable install location for {package.Id}: {portableEntry.InstallLocation}"
+            );
+            return portableEntry.InstallLocation;
         }
 
         if (
@@ -773,12 +1167,117 @@ internal sealed class WinGetPkgOperationHelper : BasePkgOperationHelper
         return null;
     }
 
+    internal sealed record PortableArpEntry(string InstallLocation, bool MachineScope);
+
+    internal static bool PortableUpdateNeedsElevation(
+        PortableArpEntry? entry,
+        Func<PortableArpEntry, string?> findLinksDirectory,
+        Func<string, bool> canCreateSymlinksIn,
+        Func<bool> canElevateAsCurrentAccount
+    ) =>
+        entry is not null
+        && canElevateAsCurrentAccount()
+        && findLinksDirectory(entry) is { } linksDirectory
+        && !canCreateSymlinksIn(linksDirectory);
+
+    internal static Func<IPackage, PortableArpEntry?> ReadPortableArpEntry { get; set; } = FindPortableArpEntry;
+
+    internal static Func<PortableArpEntry, string?> FindPortableLinksDirectory { get; set; } =
+        entry => FindLinksDirectoryPointingInto(entry, PortableLinksDirectories(entry.MachineScope));
+
+    internal static Func<string, bool> CanCreateSymlinksIn { get; set; } = ProbeSymlinkCreation;
+
+    internal static Func<bool> CanElevateAsCurrentAccount { get; set; } = TokenElevation.CanElevateAsCurrentAccount;
+
+    private static IEnumerable<string> PortableLinksDirectories(bool machineScope)
+    {
+        if (!machineScope)
+        {
+            yield return Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Microsoft",
+                "WinGet",
+                "Links"
+            );
+            yield break;
+        }
+
+        yield return Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+            "WinGet",
+            "Links"
+        );
+        yield return Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+            "WinGet",
+            "Links"
+        );
+    }
+
+    internal static string? FindLinksDirectoryPointingInto(
+        PortableArpEntry entry,
+        IEnumerable<string> linksDirectories
+    )
+    {
+        string installLocation = Path.TrimEndingDirectorySeparator(Path.GetFullPath(entry.InstallLocation))
+            + Path.DirectorySeparatorChar;
+
+        foreach (string linksDirectory in linksDirectories)
+        {
+            if (!Directory.Exists(linksDirectory))
+                continue;
+
+            foreach (string link in Directory.EnumerateFiles(linksDirectory))
+            {
+                if (new FileInfo(link).LinkTarget is not { Length: > 0 } target)
+                    continue;
+
+                string resolved = Path.GetFullPath(Path.Combine(linksDirectory, target));
+                if (resolved.StartsWith(installLocation, StringComparison.OrdinalIgnoreCase))
+                    return linksDirectory;
+            }
+        }
+
+        return null;
+    }
+
+    internal static bool ProbeSymlinkCreation(string linksDirectory)
+    {
+        string probeRoot = Path.GetDirectoryName(Path.TrimEndingDirectorySeparator(linksDirectory)) ?? linksDirectory;
+        string directory = Path.Combine(probeRoot, $"UniGetUI-symlink-probe-{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(directory);
+            string target = Path.Combine(directory, "target");
+            File.WriteAllText(target, "");
+            File.CreateSymbolicLink(Path.Combine(directory, "link"), target);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Logger.Info($"This process cannot create symbolic links next to {linksDirectory}: {ex.Message}");
+            return false;
+        }
+        finally
+        {
+            try
+            {
+                if (Directory.Exists(directory))
+                    Directory.Delete(directory, recursive: true);
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn($"Could not delete the symbolic link probe folder {directory}: {ex.Message}");
+            }
+        }
+    }
+
     /// <summary>
     /// For portable WinGet packages, reads the current install location from the Windows registry
     /// ARP entry (written by WinGet at install time). Returns null if the package is not portable
     /// or the location cannot be determined.
     /// </summary>
-    private static string? TryGetPortableInstallLocation(IPackage package)
+    private static PortableArpEntry? FindPortableArpEntry(IPackage package)
     {
         try
         {
@@ -814,23 +1313,17 @@ internal sealed class WinGetPkgOperationHelper : BasePkgOperationHelper
                     )
                         return null;
 
-                    if (
-                        entry.GetValue("InstallLocation") is string location
-                        && location.Length > 0
-                    )
-                    {
-                        Logger.Info(
-                            $"Auto-detected portable install location for {package.Id}: {location}"
-                        );
-                        return location;
-                    }
+                    if (entry.GetValue("InstallLocation") is not string { Length: > 0 } location)
+                        continue;
+
+                    return new PortableArpEntry(location, hive == Registry.LocalMachine);
                 }
             }
         }
         catch (Exception ex)
         {
             Logger.Warn(
-                $"Failed to auto-detect portable install location for {package.Id}: {ex.Message}"
+                $"Failed to read the portable install entry for {package.Id}: {ex.Message}"
             );
         }
 

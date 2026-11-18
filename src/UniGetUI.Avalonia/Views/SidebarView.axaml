@@ -201,6 +201,54 @@
                 </Panel>
             </ListBoxItem>
 
+            <ListBoxItem x:Name="AgentSkillsNavBtn" Tag="AgentSkills" Classes="nav-item" Padding="4,2" CornerRadius="6"
+                         automation:AutomationProperties.Name="{t:Translate Agent Skills}"
+                         ToolTip.Tip="{t:Translate Agent Skills}">
+                <Grid ColumnDefinitions="Auto,*" ColumnSpacing="12" Margin="8,8">
+                    <controls:SvgIcon Grid.Column="0" Path="avares://UniGetUI/Assets/Symbols/skills.svg" Width="24" Height="24" VerticalAlignment="Center"/>
+                    <TextBlock Grid.Column="1" Text="{t:Translate Agent Skills}" FontSize="14" VerticalAlignment="Center"
+                               IsVisible="{Binding $parent[local:SidebarView].ShowLabels}"/>
+                </Grid>
+            </ListBoxItem>
+
+            <ListBoxItem x:Name="DriversNavBtn" Tag="Drivers" Classes="nav-item" Padding="4,2" CornerRadius="6"
+                         automation:AutomationProperties.Name="{t:Translate Drivers}"
+                         ToolTip.Tip="{t:Translate Drivers}">
+                <Panel>
+                    <Grid ColumnDefinitions="Auto,*" ColumnSpacing="12" Margin="8,8">
+                        <controls:SvgIcon Grid.Column="0" Path="avares://UniGetUI/Assets/Symbols/drivers.svg" Width="24" Height="24" VerticalAlignment="Center"/>
+                        <TextBlock Grid.Column="1" Text="{t:Translate Drivers}"
+                                   FontSize="14"
+                                   FontWeight="Normal"
+                                   VerticalAlignment="Center"
+                                   IsVisible="{Binding $parent[local:SidebarView].ShowLabels}"/>
+                    </Grid>
+                    <Border Background="{DynamicResource AccentFillColorDefaultBrush}"
+                            CornerRadius="8"
+                            Padding="3,1"
+                            MinWidth="16"
+                            Height="16"
+                            IsVisible="{Binding DriversBadgeVisible}"
+                            HorizontalAlignment="Left"
+                            VerticalAlignment="Top"
+                            Margin="26,5,-20,0">
+                        <TextBlock Text="{Binding DriversBadgeText}"
+                                   FontSize="9"
+                                   FontWeight="Bold"
+                                   Foreground="{DynamicResource TextOnAccentFillColorPrimaryBrush}"
+                                   TextAlignment="Center"
+                                   VerticalAlignment="Center"/>
+                    </Border>
+                    <ProgressBar IsIndeterminate="{Binding DriversIsLoading}"
+                                 IsVisible="{Binding DriversIsLoading}"
+                                 Height="2"
+                                 Width="32"
+                                 MinWidth="0"
+                                 HorizontalAlignment="Left"
+                                 VerticalAlignment="Bottom"
+                                 Margin="4,0,0,2"/>
+                </Panel>
+            </ListBoxItem>
         </ListBox>
 
         <!-- Footer items -->
@@ -244,12 +292,22 @@
                 <ListBoxItem x:Name="MoreNavBtn" Tag="More" Classes="nav-item" Padding="4,2" CornerRadius="6"
                              automation:AutomationProperties.Name="{t:Translate More}"
                              ToolTip.Tip="{t:Translate More}">
-                    <Grid ColumnDefinitions="Auto,*" ColumnSpacing="12" Margin="8,8">
-                        <TextBlock Grid.Column="0" Text="···" FontSize="20" Width="24" HorizontalAlignment="Center" VerticalAlignment="Center" TextAlignment="Center"
-                                   automation:AutomationProperties.AccessibilityView="Raw"/>
-                        <TextBlock Grid.Column="1" Text="{t:Translate More}" FontSize="14" VerticalAlignment="Center"
-                                   IsVisible="{Binding $parent[local:SidebarView].ShowLabels}"/>
-                    </Grid>
+                    <Panel>
+                        <Grid ColumnDefinitions="Auto,*" ColumnSpacing="12" Margin="8,8">
+                            <TextBlock Grid.Column="0" Text="···" FontSize="20" Width="24" HorizontalAlignment="Center" VerticalAlignment="Center" TextAlignment="Center"
+                                       automation:AutomationProperties.AccessibilityView="Raw"/>
+                            <TextBlock Grid.Column="1" Text="{t:Translate More}" FontSize="14" VerticalAlignment="Center"
+                                       IsVisible="{Binding $parent[local:SidebarView].ShowLabels}"/>
+                        </Grid>
+                        <Border Background="{DynamicResource AccentFillColorDefaultBrush}"
+                                CornerRadius="5"
+                                Width="10"
+                                Height="10"
+                                IsVisible="{Binding SelfUpdateBadgeVisible}"
+                                HorizontalAlignment="Left"
+                                VerticalAlignment="Top"
+                                Margin="28,7,0,0"/>
+                    </Panel>
                     <FlyoutBase.AttachedFlyout>
                         <MenuFlyout Placement="RightEdgeAlignedTop">
                         <MenuItem Header="{t:Translate UniGetUI Log}" Command="{Binding RequestNavigationCommand}" CommandParameter="OwnLog">
@@ -261,6 +319,9 @@
                         <MenuItem Header="{t:Translate Operation history}" Command="{Binding RequestNavigationCommand}" CommandParameter="OperationHistory">
                             <MenuItem.Icon><controls:SvgIcon Path="avares://UniGetUI/Assets/Symbols/history.svg" Width="16" Height="16"/></MenuItem.Icon>
                         </MenuItem>
+                        <MenuItem Header="{t:Translate Manager health}" Command="{Binding RequestNavigationCommand}" CommandParameter="ManagerHealth">
+                            <MenuItem.Icon><controls:SvgIcon Path="avares://UniGetUI/Assets/Symbols/package_managers.svg" Width="16" Height="16"/></MenuItem.Icon>
+                        </MenuItem>
                         <Separator/>
                         <MenuItem Header="{Binding VersionLabel}" IsEnabled="False">
                             <MenuItem.Icon><controls:SvgIcon Path="avares://UniGetUI/Assets/Symbols/info_round.svg" Width="16" Height="16"/></MenuItem.Icon>
@@ -268,7 +329,19 @@
                         <MenuItem Header="{t:Translate Release notes}" Command="{Binding RequestNavigationCommand}" CommandParameter="ReleaseNotes">
                             <MenuItem.Icon><controls:SvgIcon Path="avares://UniGetUI/Assets/Symbols/megaphone.svg" Width="16" Height="16"/></MenuItem.Icon>
                         </MenuItem>
-                        <MenuItem Header="{t:Translate Check for UniGetUI updates}" Command="{Binding CheckForUpdatesCommand}">
+                        <MenuItem Command="{Binding CheckForUpdatesCommand}"
+                                  automation:AutomationProperties.Name="{Binding CheckForUpdatesLabel}">
+                            <MenuItem.Header>
+                                <StackPanel Orientation="Horizontal" Spacing="8">
+                                    <TextBlock Text="{Binding CheckForUpdatesLabel}" VerticalAlignment="Center"/>
+                                    <Ellipse Width="8"
+                                             Height="8"
+                                             Fill="{DynamicResource AccentFillColorDefaultBrush}"
+                                             IsVisible="{Binding SelfUpdateBadgeVisible}"
+                                             VerticalAlignment="Center"
+                                             Margin="0,4,0,0"/>
+                                </StackPanel>
+                            </MenuItem.Header>
                             <MenuItem.Icon><controls:SvgIcon Path="avares://UniGetUI/Assets/Symbols/update.svg" Width="16" Height="16"/></MenuItem.Icon>
                         </MenuItem>
                         <Separator/>

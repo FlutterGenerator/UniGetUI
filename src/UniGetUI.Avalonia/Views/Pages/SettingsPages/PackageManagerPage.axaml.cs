@@ -9,11 +9,14 @@ using UniGetUI.Avalonia.ViewModels;
 using UniGetUI.Avalonia.ViewModels.Pages.SettingsPages;
 using UniGetUI.Avalonia.Views.Controls;
 using UniGetUI.Avalonia.Views.Controls.Settings;
+using UniGetUI.Avalonia.Views.DialogPages;
+using UniGetUI.Core.Logging;
 using UniGetUI.Core.SettingsEngine.SecureSettings;
 using UniGetUI.Core.Tools;
 using UniGetUI.Interface.Enums;
 using UniGetUI.PackageEngine.Interfaces;
 using UniGetUI.PackageEngine.ManagerClasses.Manager;
+using UniGetUI.PackageEngine.Managers.PipManager;
 using UniGetUI.PackageEngine.Managers.VcpkgManager;
 using CoreSettings = UniGetUI.Core.SettingsEngine.Settings;
 using CornerRadius = global::Avalonia.CornerRadius;
@@ -68,6 +71,177 @@ public sealed partial class PackageManagerPage : UserControl, ISettingsPage
             _ = ViewModel.ReloadManagerCommand.ExecuteAsync(null);
         };
 
+        BuildExecutableCards(manager);
+
+        {
+            // ── Install options panel
+            var installOptions = new InstallOptionsPanel(manager);
+            installOptions.NavigateToAdministratorRequested += (_, _) =>
+                NavigationRequested?.Invoke(this, typeof(Administrator));
+            InstallOptionsHolder.Content = installOptions;
+
+            // ── Disable notifications card
+            var disableNotifsCard = new CheckboxCard_Dict
+            {
+                Text = CoreTools.Translate("Ignore packages from {pm} when showing a notification about updates")
+                               .Replace("{pm}", manager.DisplayName),
+                DictionaryName = CoreSettings.K.DisabledPackageManagerNotifications,
+                ForceInversion = true,
+                KeyName = manager.Name,
+            };
+
+            BuildExtraControls(disableNotifsCard);
+
+            // ── Per-manager minimum update age
+            ExtraControls.Children.Add(new TextBlock
+            {
+                Margin = new Thickness(44, 24, 4, 8),
+                FontWeight = FontWeight.SemiBold,
+                Text = CoreTools.Translate("Update security"),
+            });
+
+            (string Label, string Value)[] ageItems =
+            [
+                (CoreTools.Translate("Use global setting"), ""),
+            (CoreTools.Translate("No minimum age"), "0"),
+            (CoreTools.Translate("1 day"), "1"),
+            (CoreTools.Translate("{0} days", 3), "3"),
+            (CoreTools.Translate("{0} days", 7), "7"),
+            (CoreTools.Translate("{0} days", 14), "14"),
+            (CoreTools.Translate("{0} days", 30), "30"),
+            (CoreTools.Translate("Custom..."), "custom"),
+        ];
+
+            var ageCombo = new ComboBox
+            {
+                MinWidth = 200,
+                MinHeight = 32,
+                CornerRadius = new CornerRadius(4),
+                Padding = new Thickness(10, 4, 8, 5),
+            };
+            AutomationProperties.SetName(ageCombo, CoreTools.Translate("Minimum age for updates"));
+            foreach (var (label, _) in ageItems)
+                ageCombo.Items.Add(label);
+
+            string? savedAge = CoreSettings.GetDictionaryItem<string, string>(
+                CoreSettings.K.PerManagerMinimumUpdateAge, manager.Name);
+            int savedAgeIdx = Array.FindIndex(ageItems, i => i.Value == (savedAge ?? ""));
+            ageCombo.SelectedIndex = savedAgeIdx >= 0 ? savedAgeIdx : 0;
+
+            var customAgeInput = new TextBox
+            {
+                MinWidth = 200,
+                Classes = { "search-field-standalone" },
+                PlaceholderText = CoreTools.Translate("e.g. 10"),
+                [AutomationProperties.NameProperty] = CoreTools.Translate("Custom minimum age (days)"),
+                Text = CoreSettings.GetDictionaryItem<string, string>(
+                    CoreSettings.K.PerManagerMinimumUpdateAgeCustom, manager.Name) ?? "",
+            };
+            customAgeInput.TextChanged += (_, _) =>
+            {
+                string current = customAgeInput.Text ?? "";
+                string filtered = string.Concat(current.Where(char.IsDigit));
+                if (filtered != current)
+                {
+                    customAgeInput.Text = filtered;
+                    return;
+                }
+                if (filtered.Length > 0)
+                    CoreSettings.SetDictionaryItem(
+                        CoreSettings.K.PerManagerMinimumUpdateAgeCustom, manager.Name, filtered);
+                else
+                    CoreSettings.RemoveDictionaryKey<string, string>(
+                        CoreSettings.K.PerManagerMinimumUpdateAgeCustom, manager.Name);
+            };
+
+            bool initiallyCustom = savedAge == "custom";
+            var releaseDateSupport = manager.Capabilities.KnowsPackageReleaseDate;
+            bool ageSupported = releaseDateSupport != PackageReleaseDateSupport.No;
+            object ageDescription = releaseDateSupport switch
+            {
+                PackageReleaseDateSupport.No => new TextBlock
+                {
+                    Text = CoreTools.Translate("{pm} does not provide release dates for its packages, so this setting will have no effect")
+                                   .Replace("{pm}", manager.DisplayName),
+                    Foreground = new SolidColorBrush(Color.Parse("#e05252")),
+                    TextWrapping = TextWrapping.Wrap,
+                    FontSize = 12,
+                },
+                PackageReleaseDateSupport.Partial => new TextBlock
+                {
+                    Text = CoreTools.Translate("{pm} only provides release dates for some of its packages, so this setting will only apply to those packages")
+                                   .Replace("{pm}", manager.DisplayName),
+                    Foreground = new SolidColorBrush(Color.FromRgb(224, 168, 0)),
+                    TextWrapping = TextWrapping.Wrap,
+                    FontSize = 12,
+                },
+                _ => CoreTools.Translate("Override the global minimum update age for this package manager"),
+            };
+
+            ageCombo.IsEnabled = ageSupported;
+            customAgeInput.IsEnabled = ageSupported;
+
+            var minimumAgeCard = new SettingsCard
+            {
+                Header = CoreTools.Translate("Minimum age for updates"),
+                Description = ageDescription,
+                Content = ageCombo,
+                CornerRadius = initiallyCustom ? new CornerRadius(8, 8, 0, 0) : new CornerRadius(8),
+                BorderThickness = new Thickness(1),
+            };
+            var customAgeCard = new SettingsCard
+            {
+                Header = CoreTools.Translate("Custom minimum age (days)"),
+                Content = customAgeInput,
+                IsVisible = initiallyCustom,
+                CornerRadius = new CornerRadius(0, 0, 8, 8),
+                BorderThickness = new Thickness(1, 0, 1, 1),
+            };
+
+            ageCombo.SelectionChanged += (_, _) =>
+            {
+                int idx = ageCombo.SelectedIndex;
+                if (idx < 0) return;
+                string val = ageItems[idx].Value;
+
+                bool isCustom = val == "custom";
+                customAgeCard.IsVisible = isCustom;
+                minimumAgeCard.CornerRadius = isCustom ? new CornerRadius(8, 8, 0, 0) : new CornerRadius(8);
+
+                if (string.IsNullOrEmpty(val))
+                    CoreSettings.RemoveDictionaryKey<string, string>(
+                        CoreSettings.K.PerManagerMinimumUpdateAge, manager.Name);
+                else
+                    CoreSettings.SetDictionaryItem(
+                        CoreSettings.K.PerManagerMinimumUpdateAge, manager.Name, val);
+            };
+
+            ExtraControls.Children.Add(minimumAgeCard);
+            ExtraControls.Children.Add(customAgeCard);
+        }
+
+        // ── Logs card
+        ManagerLogs.Text = CoreTools.Translate("View {0} logs", manager.DisplayName);
+        ManagerLogs.Icon = UniGetUI.Interface.Enums.IconType.Console;
+        ManagerLogs.Click += (_, _) =>
+        {
+            if (TopLevel.GetTopLevel(this) is Window { DataContext: MainWindowViewModel vm })
+                vm.OpenManagerLogs(manager);
+        };
+
+        // ── pip AppExecution Alias warning
+        if (manager.Name == "Pip")
+        {
+            ManagerLogs.CornerRadius = new CornerRadius(8, 8, 0, 0);
+            AppExecutionAliasWarning.IsVisible = true;
+            AppExecutionAliasLabel.Text = CoreTools.Translate(
+                "If Python cannot be found or is not listing packages but is installed on the system, " +
+                "you may need to disable the \"python.exe\" App Execution Alias in the settings.");
+        }
+    }
+
+    private void BuildExecutableCards(IPackageManager manager)
+    {
         // ── Executable picker card
         bool customPathsAllowed = SecureSettings.Get(SecureSettings.K.AllowCustomManagerPaths);
         var execGrid = new Grid
@@ -96,23 +270,14 @@ public sealed partial class PackageManagerPage : UserControl, ISettingsPage
             Padding = new Thickness(10, 4, 8, 5),
         };
         AutomationProperties.SetName(execCombo, CoreTools.Translate("Select the executable to be used. The following list shows the executables found by UniGetUI"));
-        foreach (var path in manager.FindCandidateExecutableFiles())
+        foreach (var path in ViewModel.CandidateExecutables)
             AddExecutablePathItem(execCombo, path);
 
         string savedPath = CoreSettings.GetDictionaryItem<string, string>(CoreSettings.K.ManagerPaths, manager.Name) ?? "";
         if (!string.IsNullOrEmpty(savedPath) && File.Exists(savedPath))
             AddExecutablePathItem(execCombo, savedPath);
-        if (string.IsNullOrEmpty(savedPath))
-        {
-            var (found, path) = manager.GetExecutableFile();
-            savedPath = found ? path : "";
-        }
-        else if (!File.Exists(savedPath))
-        {
-            var (found, path) = manager.GetExecutableFile();
-            savedPath = found ? path : "";
-        }
-        execCombo.SelectedItem = savedPath;
+        var (executableFound, executablePath) = manager.GetExecutableFile();
+        execCombo.SelectedItem = executableFound ? executablePath : "";
         execCombo.IsEnabled = customPathsAllowed;
         execCombo.SelectionChanged += (s, _) =>
         {
@@ -155,26 +320,9 @@ public sealed partial class PackageManagerPage : UserControl, ISettingsPage
 
         if (!customPathsAllowed)
         {
-            var securityWarning = new TextBlock
-            {
-                Text = CoreTools.Translate("For security reasons, changing the executable file is disabled by default"),
-                FontSize = 12,
-                FontWeight = FontWeight.SemiBold,
-                Opacity = 0.7,
-                TextWrapping = TextWrapping.Wrap,
-                Classes = { "setting-warning-text" },
-            };
+            var (securityWarning, goToSecureBtn) = BuildCustomPathsWarning();
             Grid.SetRow(securityWarning, 2);
             execGrid.Children.Add(securityWarning);
-
-            var goToSecureBtn = new Button
-            {
-                Content = new TextBlock { Text = CoreTools.Translate("Change this"), FontSize = 12, Classes = { "hyperlink" } },
-                Background = Brushes.Transparent,
-                BorderThickness = new Thickness(0),
-                Padding = new Thickness(0),
-            };
-            goToSecureBtn.Click += (_, _) => ViewModel.NavigateToAdministratorCommand.Execute(null);
             Grid.SetRow(goToSecureBtn, 2);
             Grid.SetColumn(goToSecureBtn, 1);
             execGrid.Children.Add(goToSecureBtn);
@@ -227,170 +375,6 @@ public sealed partial class PackageManagerPage : UserControl, ISettingsPage
         pathCard.Description = pathLabel;
         copyBtn.Click += (_, _) => _ = CopyPathAndFlashIcon(pathLabel.Text, copyBtn, copyIcon);
         PathHolder.Content = pathCard;
-
-        // ── Install options panel
-        var installOptions = new InstallOptionsPanel(manager);
-        installOptions.NavigateToAdministratorRequested += (_, _) =>
-            NavigationRequested?.Invoke(this, typeof(Administrator));
-        InstallOptionsHolder.Content = installOptions;
-
-        // ── Disable notifications card
-        var disableNotifsCard = new CheckboxCard_Dict
-        {
-            Text = CoreTools.Translate("Ignore packages from {pm} when showing a notification about updates")
-                           .Replace("{pm}", manager.DisplayName),
-            DictionaryName = CoreSettings.K.DisabledPackageManagerNotifications,
-            ForceInversion = true,
-            KeyName = manager.Name,
-        };
-
-        BuildExtraControls(disableNotifsCard);
-
-        // ── Per-manager minimum update age
-        ExtraControls.Children.Add(new TextBlock
-        {
-            Margin = new Thickness(44, 24, 4, 8),
-            FontWeight = FontWeight.SemiBold,
-            Text = CoreTools.Translate("Update security"),
-        });
-
-        (string Label, string Value)[] ageItems =
-        [
-            (CoreTools.Translate("Use global setting"), ""),
-            (CoreTools.Translate("No minimum age"), "0"),
-            (CoreTools.Translate("1 day"), "1"),
-            (CoreTools.Translate("{0} days", 3), "3"),
-            (CoreTools.Translate("{0} days", 7), "7"),
-            (CoreTools.Translate("{0} days", 14), "14"),
-            (CoreTools.Translate("{0} days", 30), "30"),
-            (CoreTools.Translate("Custom..."), "custom"),
-        ];
-
-        var ageCombo = new ComboBox
-        {
-            MinWidth = 200,
-            MinHeight = 32,
-            CornerRadius = new CornerRadius(4),
-            Padding = new Thickness(10, 4, 8, 5),
-        };
-        AutomationProperties.SetName(ageCombo, CoreTools.Translate("Minimum age for updates"));
-        foreach (var (label, _) in ageItems)
-            ageCombo.Items.Add(label);
-
-        string? savedAge = CoreSettings.GetDictionaryItem<string, string>(
-            CoreSettings.K.PerManagerMinimumUpdateAge, manager.Name);
-        int savedAgeIdx = Array.FindIndex(ageItems, i => i.Value == (savedAge ?? ""));
-        ageCombo.SelectedIndex = savedAgeIdx >= 0 ? savedAgeIdx : 0;
-
-        var customAgeInput = new TextBox
-        {
-            MinWidth = 200,
-            Classes = { "search-field-standalone" },
-            PlaceholderText = CoreTools.Translate("e.g. 10"),
-            [AutomationProperties.NameProperty] = CoreTools.Translate("Custom minimum age (days)"),
-            Text = CoreSettings.GetDictionaryItem<string, string>(
-                CoreSettings.K.PerManagerMinimumUpdateAgeCustom, manager.Name) ?? "",
-        };
-        customAgeInput.TextChanged += (_, _) =>
-        {
-            string current = customAgeInput.Text ?? "";
-            string filtered = string.Concat(current.Where(char.IsDigit));
-            if (filtered != current)
-            {
-                customAgeInput.Text = filtered;
-                return;
-            }
-            if (filtered.Length > 0)
-                CoreSettings.SetDictionaryItem(
-                    CoreSettings.K.PerManagerMinimumUpdateAgeCustom, manager.Name, filtered);
-            else
-                CoreSettings.RemoveDictionaryKey<string, string>(
-                    CoreSettings.K.PerManagerMinimumUpdateAgeCustom, manager.Name);
-        };
-
-        bool initiallyCustom = savedAge == "custom";
-        var releaseDateSupport = manager.Capabilities.KnowsPackageReleaseDate;
-        bool ageSupported = releaseDateSupport != PackageReleaseDateSupport.No;
-        object ageDescription = releaseDateSupport switch
-        {
-            PackageReleaseDateSupport.No => new TextBlock
-            {
-                Text = CoreTools.Translate("{pm} does not provide release dates for its packages, so this setting will have no effect")
-                               .Replace("{pm}", manager.DisplayName),
-                Foreground = new SolidColorBrush(Color.Parse("#e05252")),
-                TextWrapping = TextWrapping.Wrap,
-                FontSize = 12,
-            },
-            PackageReleaseDateSupport.Partial => new TextBlock
-            {
-                Text = CoreTools.Translate("{pm} only provides release dates for some of its packages, so this setting will only apply to those packages")
-                               .Replace("{pm}", manager.DisplayName),
-                Foreground = new SolidColorBrush(Color.FromRgb(224, 168, 0)),
-                TextWrapping = TextWrapping.Wrap,
-                FontSize = 12,
-            },
-            _ => CoreTools.Translate("Override the global minimum update age for this package manager"),
-        };
-
-        ageCombo.IsEnabled = ageSupported;
-        customAgeInput.IsEnabled = ageSupported;
-
-        var minimumAgeCard = new SettingsCard
-        {
-            Header = CoreTools.Translate("Minimum age for updates"),
-            Description = ageDescription,
-            Content = ageCombo,
-            CornerRadius = initiallyCustom ? new CornerRadius(8, 8, 0, 0) : new CornerRadius(8),
-            BorderThickness = new Thickness(1),
-        };
-        var customAgeCard = new SettingsCard
-        {
-            Header = CoreTools.Translate("Custom minimum age (days)"),
-            Content = customAgeInput,
-            IsVisible = initiallyCustom,
-            CornerRadius = new CornerRadius(0, 0, 8, 8),
-            BorderThickness = new Thickness(1, 0, 1, 1),
-        };
-
-        ageCombo.SelectionChanged += (_, _) =>
-        {
-            int idx = ageCombo.SelectedIndex;
-            if (idx < 0) return;
-            string val = ageItems[idx].Value;
-
-            bool isCustom = val == "custom";
-            customAgeCard.IsVisible = isCustom;
-            minimumAgeCard.CornerRadius = isCustom ? new CornerRadius(8, 8, 0, 0) : new CornerRadius(8);
-
-            if (string.IsNullOrEmpty(val))
-                CoreSettings.RemoveDictionaryKey<string, string>(
-                    CoreSettings.K.PerManagerMinimumUpdateAge, manager.Name);
-            else
-                CoreSettings.SetDictionaryItem(
-                    CoreSettings.K.PerManagerMinimumUpdateAge, manager.Name, val);
-        };
-
-        ExtraControls.Children.Add(minimumAgeCard);
-        ExtraControls.Children.Add(customAgeCard);
-
-        // ── Logs card
-        ManagerLogs.Text = CoreTools.Translate("View {0} logs", manager.DisplayName);
-        ManagerLogs.Icon = UniGetUI.Interface.Enums.IconType.Console;
-        ManagerLogs.Click += (_, _) =>
-        {
-            if (TopLevel.GetTopLevel(this) is Window { DataContext: MainWindowViewModel vm })
-                vm.OpenManagerLogs(manager);
-        };
-
-        // ── pip AppExecution Alias warning
-        if (manager.Name == "Pip")
-        {
-            ManagerLogs.CornerRadius = new CornerRadius(8, 8, 0, 0);
-            AppExecutionAliasWarning.IsVisible = true;
-            AppExecutionAliasLabel.Text = CoreTools.Translate(
-                "If Python cannot be found or is not listing packages but is installed on the system, " +
-                "you may need to disable the \"python.exe\" App Execution Alias in the settings.");
-        }
     }
 
     private static IReadOnlyList<FilePickerFileType> GetExecutableFileTypeFilter()
@@ -591,6 +575,13 @@ public sealed partial class PackageManagerPage : UserControl, ISettingsPage
                 });
                 break;
 
+            case "Pip":
+                disableNotifsCard.CornerRadius = new CornerRadius(8, 8, 0, 0);
+                disableNotifsCard.BorderThickness = new Thickness(1, 1, 1, 0);
+                ExtraControls.Children.Add(disableNotifsCard);
+                ExtraControls.Children.Add(BuildPythonEnvironmentsCard());
+                break;
+
             case "vcpkg":
                 disableNotifsCard.CornerRadius = new CornerRadius(8, 8, 0, 0);
                 disableNotifsCard.BorderThickness = new Thickness(1, 1, 1, 0);
@@ -616,6 +607,148 @@ public sealed partial class PackageManagerPage : UserControl, ISettingsPage
                 ExtraControls.Children.Add(disableNotifsCard);
                 break;
         }
+    }
+
+    private SettingsCard BuildPythonEnvironmentsCard()
+    {
+        var rows = new StackPanel { Spacing = 8, Margin = new Thickness(0, 8, 0, 0) };
+        var description = new StackPanel { Spacing = 4 };
+        description.Children.Add(new TextBlock
+        {
+            Text = CoreTools.Translate("UniGetUI only manages the Python environments checked below. Virtual environments, conda environments and embedded Pythons usually belong to other apps, so they are not managed unless you check them."),
+            FontSize = 12,
+            Opacity = 0.7,
+            TextWrapping = TextWrapping.Wrap,
+        });
+        description.Children.Add(rows);
+
+        if (!Pip.CanOptInEnvironments())
+        {
+            var gate = new Grid { ColumnDefinitions = new ColumnDefinitions("*,Auto") };
+            var (warning, change) = BuildCustomPathsWarning();
+            gate.Children.Add(warning);
+            Grid.SetColumn(change, 1);
+            gate.Children.Add(change);
+            description.Children.Add(gate);
+        }
+
+        void Fill()
+        {
+            rows.Children.Clear();
+            List<string> interpreters = [];
+            string savedPath = CoreSettings.GetDictionaryItem<string, string>(CoreSettings.K.ManagerPaths, ViewModel.Manager.Name) ?? "";
+            foreach (string path in ViewModel.CandidateExecutables.Append(savedPath).Append(ViewModel.Manager.Status.ExecutablePath))
+            {
+                if (path.Length > 0 && File.Exists(path) && !interpreters.Any(known => Pip.IsSameEnvironment(known, path)))
+                    interpreters.Add(path);
+            }
+
+            if (interpreters.Count == 0)
+            {
+                rows.Children.Add(new TextBlock
+                {
+                    Text = CoreTools.Translate("No Python interpreters were found"),
+                    FontSize = 12,
+                });
+                return;
+            }
+
+            foreach (string path in interpreters)
+                rows.Children.Add(BuildPythonEnvironmentRow(path));
+        }
+
+        Fill();
+        rows.IsEnabled = !ViewModel.IsLoading;
+        ViewModel.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName != nameof(PackageManagerViewModel.IsLoading))
+                return;
+
+            rows.IsEnabled = !ViewModel.IsLoading;
+            if (!ViewModel.IsLoading)
+                Fill();
+        };
+
+        return new SettingsCard
+        {
+            Header = CoreTools.Translate("Python environments"),
+            Description = description,
+            CornerRadius = new CornerRadius(0, 0, 8, 8),
+            BorderThickness = new Thickness(1, 0, 1, 1),
+        };
+    }
+
+    private Grid BuildPythonEnvironmentRow(string path)
+    {
+        PythonEnvironmentKind kind = Pip.ClassifyEnvironment(path);
+        string kindText = kind switch
+        {
+            PythonEnvironmentKind.VirtualEnvironment => CoreTools.Translate("Virtual environment"),
+            PythonEnvironmentKind.CondaEnvironment => CoreTools.Translate("Conda environment"),
+            PythonEnvironmentKind.Embedded => CoreTools.Translate("Embedded Python"),
+            PythonEnvironmentKind.StoreAlias => CoreTools.Translate("Microsoft Store alias"),
+            PythonEnvironmentKind.Unknown => CoreTools.Translate("Unrecognized Python"),
+            _ => CoreTools.Translate("System Python"),
+        };
+        if (Pip.IsSameEnvironment(ViewModel.Manager.Status.ExecutablePath, path))
+            kindText += " · " + CoreTools.Translate("In use");
+
+        var row = new Grid { ColumnDefinitions = new ColumnDefinitions("*,Auto") };
+        var labels = new StackPanel { Spacing = 2 };
+        labels.Children.Add(new TextBlock
+        {
+            Text = path,
+            FontFamily = new FontFamily("Consolas,Cascadia Mono,Menlo,monospace"),
+            TextWrapping = TextWrapping.Wrap,
+        });
+        labels.Children.Add(new TextBlock
+        {
+            Text = kindText,
+            FontSize = 12,
+            Opacity = 0.7,
+        });
+        row.Children.Add(labels);
+
+        var manage = new CheckBox
+        {
+            Content = CoreTools.Translate("Manage"),
+            IsChecked = Pip.IsEnvironmentManaged(path, kind)
+                || (ViewModel.Manager is Pip pip && pip.IsChosenExecutable(path)),
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(8, 0, 0, 0),
+        };
+        manage.IsEnabled = Pip.CanOptInEnvironments() || Pip.IsManagedByDefault(kind) || manage.IsChecked == true;
+        AutomationProperties.SetName(manage, CoreTools.Translate("Manage the Python environment at {0}", path));
+        manage.IsCheckedChanged += (_, _) =>
+        {
+            Pip.SetEnvironmentManaged(path, manage.IsChecked == true);
+            _ = ViewModel.ReloadManagerCommand.ExecuteAsync(null);
+        };
+        Grid.SetColumn(manage, 1);
+        row.Children.Add(manage);
+        return row;
+    }
+
+    private (TextBlock Warning, Button Change) BuildCustomPathsWarning()
+    {
+        var warning = new TextBlock
+        {
+            Text = CoreTools.Translate("For security reasons, changing the executable file is disabled by default"),
+            FontSize = 12,
+            FontWeight = FontWeight.SemiBold,
+            Opacity = 0.7,
+            TextWrapping = TextWrapping.Wrap,
+            Classes = { "setting-warning-text" },
+        };
+        var change = new Button
+        {
+            Content = new TextBlock { Text = CoreTools.Translate("Change this"), FontSize = 12, Classes = { "hyperlink" } },
+            Background = Brushes.Transparent,
+            BorderThickness = new Thickness(0),
+            Padding = new Thickness(0),
+        };
+        change.Click += (_, _) => ViewModel.NavigateToAdministratorCommand.Execute(null);
+        return (warning, change);
     }
 
     private ButtonCard BuildVcpkgRootCard()

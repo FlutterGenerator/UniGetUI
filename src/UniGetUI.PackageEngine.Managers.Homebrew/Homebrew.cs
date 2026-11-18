@@ -29,6 +29,17 @@ internal sealed class HomebrewSource : ManagerSource
 
 public partial class Homebrew : PackageManager
 {
+    protected override IEnumerable<ManagerMaintenanceAction> GetExtraMaintenanceActions()
+    {
+        yield return new ManagerMaintenanceAction
+        {
+            Id = "clear-cache",
+            Title = CoreTools.Translate("Clear cache"),
+            Description = CoreTools.Translate("Remove old versions and the download cache Homebrew keeps."),
+            RunAsync = () => RunMaintenanceCommandAsync(Status.ExecutablePath, WithCallArguments("cleanup -s")),
+        };
+    }
+
     // Standard Homebrew installation paths, in priority order
     private static readonly string[] BREW_PATHS =
     [
@@ -37,12 +48,16 @@ public partial class Homebrew : PackageManager
         "/home/linuxbrew/.linuxbrew/bin/brew",           // Linux
     ];
 
+    private const string INSTALL_COMMAND =
+        "/bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"";
+
     public Homebrew()
     {
         Dependencies = [];
 
         Capabilities = new ManagerCapabilities
         {
+            CanReinstallOnUpdate = true,
             CanRunAsAdmin = false,
             CanDownloadInstaller = false,
             SupportsCustomSources = true,
@@ -60,6 +75,8 @@ public partial class Homebrew : PackageManager
         {
             Id = "homebrew",
             Name = "Homebrew",
+            SetupGuide = "PACKAGE_MANAGERS.md#homebrew",
+            InstallCommands = new(MacOS: INSTALL_COMMAND, Linux: INSTALL_COMMAND),
             Description = CoreTools.Translate(
                 "The Missing Package Manager for macOS (or Linux).<br>Contains: <b>Formulae, Casks</b>"
             ),

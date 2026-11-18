@@ -680,6 +680,8 @@ public class CatalogEditorTests : IDisposable
         public long InstalledPackagesGeneration => 0;
         public void InvalidateInstalledPackages() { }
         public int? CompareVersions(string versionA, string versionB) => throw new NotSupportedException();
+        public bool CanUpdateToExactVersion => false;
+        public IPackage? ResolveSkippedMajorUpdate(IPackage update, UniGetUI.PackageEngine.Serializable.InstallOptions? options = null) => update;
         public void Initialize() => throw new NotSupportedException();
         public bool IsEnabled() => true;
         public bool IsReady() => true;
@@ -692,6 +694,15 @@ public class CatalogEditorTests : IDisposable
             if (Failure is not null) throw Failure;
             return Results;
         }
+        public IReadOnlyList<IPackage> FindPackages(string query, out bool failed)
+        {
+            failed = false;
+            return FindPackages(query);
+        }
+        public ManagerHealthRecord GetHealthRecord() => new();
+        public bool ExpectsInstalledPackages => false;
+        public bool IsInitializing => false;
+        public IReadOnlyList<ManagerMaintenanceAction> GetMaintenanceActions() => [];
         public IReadOnlyList<IPackage> GetAvailableUpdates() => throw new NotSupportedException();
         public IReadOnlyList<IPackage> GetInstalledPackages() => throw new NotSupportedException();
         public void RefreshPackageIndexes() => throw new NotSupportedException();

@@ -61,11 +61,13 @@ public partial class ImmersiveConfirmationDialog : ImmersiveDialog
             DispatcherPriority.Background);
     }
 
-    private void Complete(bool result)
+    protected void Complete(bool result)
     {
         Result = result;
         Close();
     }
+
+    internal void Accept() => Complete(true);
 
     internal void CancelPendingChoice()
     {

@@ -29,6 +29,7 @@ public class PrePostOperation : AbstractOperation
 
     protected override async Task<OperationVeredict> PerformOperation()
     {
+        RefreshPersistedEnvironment();
         Line($"Running command {Payload}", LineType.Information);
         using var process = new Process
         {
@@ -50,7 +51,7 @@ public class PrePostOperation : AbstractOperation
         DataReceivedEventHandler errorHandler = (_, e) =>
         {
             if (e.Data is not null)
-                Line(e.Data, LineType.Error);
+                Line(e.Data, LineType.StandardError);
         };
         process.OutputDataReceived += outputHandler;
         process.ErrorDataReceived += errorHandler;

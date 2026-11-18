@@ -26,6 +26,7 @@ namespace UniGetUI.PackageEngine.Managers.PowerShell7Manager
             {
                 CanRunAsAdmin = true,
                 SupportsCustomVersions = true,
+                SupportsCustomVersionsOnUpdate = false,
                 SupportsCustomScopes = true,
                 // Uninstall-PSResource targets the scope the package was detected in, so the selector is a no-op there
                 SupportsCustomScopesOnUninstall = false,
@@ -50,6 +51,8 @@ namespace UniGetUI.PackageEngine.Managers.PowerShell7Manager
             {
                 Id = "pwsh",
                 Name = "PowerShell7",
+                SetupGuide = "PACKAGE_MANAGERS.md#powershell-7x",
+                InstallCommands = new(Windows: "winget install --exact --id Microsoft.PowerShell", MacOS: "brew install powershell"),
                 DisplayName = "PowerShell 7.x",
                 Description = CoreTools.Translate(
                     "PowerShell's package manager. Find libraries and scripts to expand PowerShell capabilities<br>Contains: <b>Modules, Scripts, Cmdlets</b>"

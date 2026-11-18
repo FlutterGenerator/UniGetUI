@@ -30,11 +30,15 @@ namespace UniGetUI.PackageEngine.ManagerClasses.Manager
     {
         public bool IsDummy = false;
         public bool CanRunAsAdmin = false;
+        public bool MustNotRunElevated = false;
+        public bool ElevatesItself = false;
         public bool CanSkipIntegrityChecks = false;
         public bool CanRunInteractively = false;
         public bool CanRemoveDataOnUninstall = false;
         // False for managers that install but cannot remove, such as macOS .pkg files.
         public bool CanUninstall = true;
+        public bool CanReinstallOnUpdate = false;
+        public bool ReinstallsOnUpdateOnlyGlobalPackages = false;
         // False when the installed inventory cannot tell which source a package came from (Chocolatey
         // assigns its default source; a macOS .pkg receipt or app records no feed).
         public bool InstalledPackagesKeepTheirSource = true;
@@ -62,6 +66,7 @@ namespace UniGetUI.PackageEngine.ManagerClasses.Manager
         public ProxySupport SupportsProxy = ProxySupport.No;
         public bool SupportsProxyAuth = false;
         public PackageReleaseDateSupport KnowsPackageReleaseDate = PackageReleaseDateSupport.No;
+
         public SourceCapabilities Sources { get; set; }
 
         public ManagerCapabilities()

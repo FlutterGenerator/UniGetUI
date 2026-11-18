@@ -93,7 +93,7 @@ public partial class InstallOptionsViewModel : ObservableObject
     public string KillProcessesDescriptionLabel { get; } = CoreTools.Translate(
         "Select the processes that should be closed before this package is installed, updated or uninstalled.");
     public string KillProcessesPlaceholderLabel { get; } = CoreTools.Translate(
-        "Write here the process names here, separated by commas (,)");
+        "Enter the process names here, separated by commas (,)");
     public string ForceKillLabelText { get; } = CoreTools.Translate(
         "Try to kill the processes that refuse to close when requested to");
 
@@ -102,9 +102,11 @@ public partial class InstallOptionsViewModel : ObservableObject
     public string InteractiveCheckBox_Content { get; } = CoreTools.Translate("Interactive installation");
     public string SkipHashCheckBox_Content { get; } = CoreTools.Translate("Skip hash check");
     public string UninstallPrevCheckBox_Content { get; } = CoreTools.Translate("Uninstall previous versions when updated");
+    public string UninstallBeforeUpdateCheckBox_Content { get; } = CoreTools.Translate("Uninstall, then reinstall when updated");
     public string SkipMinorCheckBox_Content { get; } = CoreTools.Translate("Skip minor updates for this package");
     public string SkipMinorLevelPrefix_Content { get; } = CoreTools.Translate("Ignore changes after the first");
     public string SkipMinorLevelSuffix_Content { get; } = CoreTools.Translate("version numbers");
+    public string SkipMajorCheckBox_Content { get; } = CoreTools.Translate("Skip major updates for this package");
     public string AutoUpdateCheckBox_Content { get; } = CoreTools.Translate("Automatically update this package");
     public string IgnoreUpdatesCheckBox_Content { get; } = CoreTools.Translate("Ignore future updates for this package");
     public string AutoUpdateHint_Content { get; } = BuildAutoUpdateHint();
@@ -124,6 +126,7 @@ public partial class InstallOptionsViewModel : ObservableObject
     public bool CanRunInteractively { get; }
     public bool CanSkipHash { get; }
     public bool CanUninstallPrev { get; }
+    public bool CanUninstallBeforeUpdate { get; }
     public bool HasCustomScopes { get; }
     public bool HasCustomLocations { get; }
 
@@ -168,6 +171,7 @@ public partial class InstallOptionsViewModel : ObservableObject
     [ObservableProperty] private bool _skipHashChecked;
     [ObservableProperty] private bool _skipHashEnabled;
     [ObservableProperty] private bool _uninstallPrevChecked;
+    [ObservableProperty] private bool _uninstallBeforeUpdateChecked;
 
     [ObservableProperty] private bool _versionEnabled;
     public ObservableCollection<string> VersionOptions { get; } = [];
@@ -180,6 +184,7 @@ public partial class InstallOptionsViewModel : ObservableObject
     // Index 0 => keep first 1 number significant (level 2), 1 => first 2 (level 3), 2 => first 3 (level 4).
     public ObservableCollection<string> SkipMinorLevelOptions { get; } = ["1", "2", "3"];
     [ObservableProperty] private int _skipMinorLevelIndex;
+    [ObservableProperty] private bool _skipMajorChecked;
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(IsAutoUpdateHintVisible))]
     private bool _autoUpdateChecked;
@@ -294,6 +299,7 @@ public partial class InstallOptionsViewModel : ObservableObject
         CanRunInteractively = caps.CanRunInteractively;
         CanSkipHash = caps.CanSkipIntegrityChecks;
         CanUninstallPrev = caps.CanUninstallPreviousVersionsAfterUpdate;
+        CanUninstallBeforeUpdate = PackageOperation.SupportsUninstallBeforeUpdate(package);
         HasCustomScopes = caps.SupportsCustomScopes;
         HasCustomLocations = caps.SupportsCustomLocations;
 
@@ -327,8 +333,10 @@ public partial class InstallOptionsViewModel : ObservableObject
         SkipHashChecked = options.SkipHashCheck;
         SkipHashEnabled = caps.CanSkipIntegrityChecks;
         UninstallPrevChecked = options.UninstallPreviousVersionsOnUpdate;
+        UninstallBeforeUpdateChecked = options.UninstallBeforeUpdate;
         SkipMinorChecked = options.SkipMinorUpdates;
         SkipMinorLevelIndex = options.SkipMinorUpdatesLevel - 2; // level is validated to 2..4 by the getter
+        SkipMajorChecked = options.SkipMajorUpdates;
         AutoUpdateChecked = AutoUpdatesDatabase.IsAutoUpdated(package);
 
         // Version
@@ -725,8 +733,10 @@ public partial class InstallOptionsViewModel : ObservableObject
         o.InteractiveInstallation = InteractiveChecked;
         o.SkipHashCheck = SkipHashChecked;
         o.UninstallPreviousVersionsOnUpdate = UninstallPrevChecked;
+        o.UninstallBeforeUpdate = UninstallBeforeUpdateChecked;
         o.SkipMinorUpdates = SkipMinorChecked;
         o.SkipMinorUpdatesLevel = SkipMinorLevelIndex + 2;
+        o.SkipMajorUpdates = SkipMajorChecked;
         o.OverridesNextLevelOpts = !FollowGlobal;
 
         var ver = SelectedVersion ?? "";
@@ -764,8 +774,10 @@ public partial class InstallOptionsViewModel : ObservableObject
         _options.InteractiveInstallation = s.InteractiveInstallation;
         _options.SkipHashCheck = s.SkipHashCheck;
         _options.UninstallPreviousVersionsOnUpdate = s.UninstallPreviousVersionsOnUpdate;
+        _options.UninstallBeforeUpdate = s.UninstallBeforeUpdate;
         _options.SkipMinorUpdates = s.SkipMinorUpdates;
         _options.SkipMinorUpdatesLevel = s.SkipMinorUpdatesLevel;
+        _options.SkipMajorUpdates = s.SkipMajorUpdates;
         _options.OverridesNextLevelOpts = s.OverridesNextLevelOpts;
         _options.PreRelease = s.PreRelease;
         _options.Version = s.Version;

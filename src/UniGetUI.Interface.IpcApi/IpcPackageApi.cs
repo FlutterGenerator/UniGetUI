@@ -190,14 +190,29 @@ public static class IpcPackageApi
         );
     }
 
-    public static Task<IpcPackageOperationResult> UpdatePackageAsync(
+    public static async Task<IpcPackageOperationResult> UpdatePackageAsync(
         IpcPackageActionRequest request
     )
     {
         ArgumentNullException.ThrowIfNull(request);
 
         var package = FindUpgradablePackageOrInstalledPackage(request);
-        return ExecuteOperationAsync(
+        if (
+            package.IsUpgradable
+            && string.IsNullOrWhiteSpace(request.Version)
+            && UpgradablePackagesLoader.Instance is { } loader
+        )
+        {
+            var effectiveOptions = await InstallOptionsFactory.LoadApplicableAsync(package);
+            ApplyRequestOptions(effectiveOptions, request);
+            package =
+                await loader.ResolveSkippedMajorUpdateAsync(package, effectiveOptions)
+                ?? throw new InvalidOperationException(
+                    $"No update of {package.Id} is available within its installed major version, and major updates are skipped for it."
+                );
+        }
+
+        return await ExecuteOperationAsync(
             "update-package",
             package,
             request,
@@ -215,10 +230,23 @@ public static class IpcPackageApi
     )
     {
         List<AbstractOperation> operations = [];
-        foreach (var package in await GetUpdatesToApplyAsync(managerName))
+        foreach (var listed in await GetUpdatesToApplyAsync(managerName))
         {
+            var package = UpgradablePackagesLoader.Instance is { } loader
+                ? await loader.ResolveSkippedMajorUpdateAsync(listed)
+                : listed;
+            if (package is null)
+            {
+                continue;
+            }
+
             var options = await InstallOptionsFactory.LoadApplicableAsync(package);
             if (PackageOperation.HasPendingOperation(package, OperationType.Update))
+            {
+                continue;
+            }
+
+            if (PackageOperation.IsLeftOutOfBulkUpdates(package, options))
             {
                 continue;
             }
@@ -585,10 +613,26 @@ public static class IpcPackageApi
         try
         {
             await operation.MainThread();
+            await RefreshPackageSnapshotsAsync();
         }
         finally
         {
             operation.Dispose();
+        }
+    }
+
+    // The installed loader keeps multiple versions, so a downgrade or reinstall leaves the old entry cached.
+    private static async Task RefreshPackageSnapshotsAsync()
+    {
+        try
+        {
+            await ReloadAfterCurrentLoadAsync(InstalledPackagesLoader.Instance);
+            await RefreshUpgradablePackagesSnapshotAsync();
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn("Could not refresh package snapshots after an IPC operation");
+            Logger.Warn(ex);
         }
     }
 
@@ -600,6 +644,7 @@ public static class IpcPackageApi
         if (!string.IsNullOrWhiteSpace(request.Version))
         {
             options.Version = request.Version;
+            options.VersionIsExplicit = true;
         }
 
         if (!string.IsNullOrWhiteSpace(request.Scope))
@@ -805,14 +850,19 @@ public static class IpcPackageApi
         return GetManagers(managerName).SelectMany(manager => manager.GetInstalledPackages()).ToArray();
     }
 
-    private static async Task RefreshUpgradablePackagesSnapshotAsync()
+    private static Task RefreshUpgradablePackagesSnapshotAsync()
+        => ReloadAfterCurrentLoadAsync(UpgradablePackagesLoader.Instance);
+
+    // A load that started before the package change returns stale data, so reload after it ends.
+    private static async Task ReloadAfterCurrentLoadAsync(AbstractPackageLoader? loader)
     {
-        if (UpgradablePackagesLoader.Instance is null || UpgradablePackagesLoader.Instance.IsLoading)
+        if (loader is null)
         {
             return;
         }
 
-        await UpgradablePackagesLoader.Instance.ReloadPackages();
+        await loader.WaitForCurrentLoadAsync();
+        await loader.ReloadPackages();
     }
 
     private static IReadOnlyList<IPackage> GetUpgradablePackagesSnapshot(string? managerName)
@@ -840,6 +890,9 @@ public static class IpcPackageApi
         {
             return [];
         }
+
+        // A reload clears the list first; reading it during the reload returns an empty or partial list.
+        loader.WaitForCurrentLoadAsync().GetAwaiter().GetResult();
 
         if (loader.Packages.Count > 0)
         {
